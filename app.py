@@ -107,6 +107,9 @@ def get_et_data_cached(
 
 def initialize_session_state():
     """Initialize Streamlit session state variables if they don't exist."""
+    today = datetime.now().date()
+    last_year = today - timedelta(days=365)
+    
     if 'user_polygon' not in st.session_state:
         st.session_state['user_polygon'] = None
     
@@ -125,6 +128,13 @@ def initialize_session_state():
     if 'api_key' not in st.session_state:
         # Try to get from environment
         st.session_state['api_key'] = os.environ.get('OPENET_API_KEY', '')
+        
+    # Initialize date values
+    if 'start_date' not in st.session_state:
+        st.session_state['start_date'] = last_year.isoformat()
+    
+    if 'end_date' not in st.session_state:
+        st.session_state['end_date'] = today.isoformat()
 
 def create_map(center=DEFAULT_CENTER, zoom=DEFAULT_ZOOM):
     """
@@ -322,27 +332,68 @@ def render_data_parameters():
     
     col1, col2, col3 = st.columns(3)
     
+    # Save dates in session state to handle dependencies properly
+    if 'start_date' not in st.session_state:
+        st.session_state['start_date'] = (datetime.now().date() - timedelta(days=365)).isoformat()
+    if 'end_date' not in st.session_state:
+        st.session_state['end_date'] = datetime.now().date().isoformat()
+        
+    # Callback functions to update session state
+    def update_start_date():
+        start = st.session_state['start_date_input']
+        st.session_state['start_date'] = start.isoformat()
+        
+    def update_end_date():
+        end = st.session_state['end_date_input']
+        st.session_state['end_date'] = end.isoformat()
+        
     with col1:
         # Date range selection
         today = datetime.now().date()
         last_year = today - timedelta(days=365)
         
+        # Convert stored string dates back to date objects
+        default_start = datetime.fromisoformat(st.session_state['start_date']).date()
+        
+        # Future date for consistency with end date
+        future_date = today + timedelta(days=365*10)  # 10 years in the future
+        
         start_date = st.date_input(
             "Start Date", 
-            value=last_year,
+            value=default_start,
             min_value=datetime(1985, 1, 1).date(),  # OpenET data starts around 1985
-            max_value=today,
-            help="Select the start date for ET data"
+            max_value=future_date,  # Allow future dates for forecasting scenarios
+            help="Select the start date for ET data",
+            key="start_date_input",
+            on_change=update_start_date
         )
     
     with col2:
+        # Convert stored string dates back to date objects
+        default_end = datetime.fromisoformat(st.session_state['end_date']).date()
+        
+        # Allow end dates into the future (10 years from now)
+        future_date = today + timedelta(days=365*10)  # 10 years in the future
+        
         end_date = st.date_input(
             "End Date", 
-            value=today,
-            min_value=start_date,
-            max_value=today,
-            help="Select the end date for ET data"
+            value=default_end,
+            min_value=datetime(1985, 1, 1).date(),  # Remove dependency on start_date
+            max_value=future_date,  # Allow selection of future dates
+            help="Select the end date for ET data (can include future dates for forecasting)",
+            key="end_date_input",
+            on_change=update_end_date
         )
+        
+        # Add validation for end date being before start date
+        if end_date < start_date:
+            st.error("End date cannot be before start date")
+            end_date = start_date  # Force end date to be at least start date
+            
+        # Show warning message if future dates are selected
+        today = datetime.now().date()
+        if end_date > today:
+            st.warning("FUTURE DATES NOT SUPPORTED: The OpenET API does not support future dates and API calls with future dates will not be run. In a future version, we will incorporate ET forecasting, but for now this functionality is a stub.")
     
     with col3:
         # Data interval
@@ -407,19 +458,29 @@ def render_data_parameters():
     )
     
     # Fetch data button
+    # Disable the button if no polygon, no API key, or future dates selected
+    today = datetime.now().date()
+    has_future_dates = end_date > today
+    
     fetch_disabled = not st.session_state['user_polygon'] or not api_key
     
     if st.button("Fetch ET Data", disabled=fetch_disabled, type="primary"):
-        if st.session_state['last_query_params'] == current_params and st.session_state['et_data'] is not None:
+        # Check again for future dates - if selected, show a clear message
+        if has_future_dates:
+            st.error("API CALL BLOCKED: Cannot fetch data for future dates. Please select an end date no later than today.")
+        elif st.session_state['last_query_params'] == current_params and st.session_state['et_data'] is not None:
             st.success("Using cached data. Same parameters as previous query.")
         else:
             with st.spinner("Fetching data from OpenET API..."):
                 try:
+                    # FUTURE ENHANCEMENT: This is where ET forecasting would be implemented
+                    # For now, we only fetch historical data up to the present
+                    
                     # Fetch data
                     df = get_et_data_cached(
                         geometry=st.session_state['user_polygon'],
                         start_date=start_date.isoformat(),
-                        end_date=end_date.isoformat(),
+                        end_date=min(end_date, today).isoformat(),  # Ensure end date is not in the future
                         interval=interval,
                         model=model,
                         variable=variable,
@@ -431,7 +492,7 @@ def render_data_parameters():
                     else:
                         st.session_state['et_data'] = df
                         st.session_state['last_query_params'] = current_params
-                        st.success(f"Data retrieved successfully: {len(df)} data points from {start_date} to {end_date}")
+                        st.success(f"Data retrieved successfully: {len(df)} data points from {start_date} to {min(end_date, today)}")
                 
                 except OpenETError as e:
                     st.error(f"Error fetching data: {str(e)}")

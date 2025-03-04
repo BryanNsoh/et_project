@@ -57,7 +57,9 @@ def call_openet_api(
     Call the OpenET API to retrieve ET data for a specified geometry and time period.
     
     Args:
-        geometry: Coordinates in WGS84 format for a point [lon, lat] or polygon [[[lon1, lat1], ...]]
+        geometry: Coordinates in WGS84 format:
+            - For point: [lon, lat]
+            - For polygon: [[lon1, lat1], [lon2, lat2], ...] (will be automatically flattened to [lon1, lat1, lon2, lat2, ...])
         start_date: Start date in YYYY-MM-DD format
         end_date: End date in YYYY-MM-DD format
         interval: Time interval, either "daily" or "monthly"
@@ -72,6 +74,10 @@ def call_openet_api(
         
     Raises:
         OpenETError: For API errors or failed requests
+        
+    Note:
+        For polygon requests, the geometry will be automatically flattened to a 1-dimensional array
+        and a "reducer" parameter (default="mean") will be added to the request as required by the API.
     """
     if not api_key:
         api_key = load_api_key()
@@ -79,11 +85,24 @@ def call_openet_api(
     # Determine if point or polygon
     is_point = isinstance(geometry[0], (int, float))
     
-    # Construct URL
-    base_url = "https://openet-api.org/raster/timeseries"
-    endpoint = f"{base_url}/point" if is_point else base_url
+    # Construct URL according to official OpenET documentation
+    base_url = "https://openet-api.org"
+    if is_point:
+        endpoint = f"{base_url}/raster/timeseries/point"
+    else:
+        endpoint = f"{base_url}/raster/timeseries/polygon"
+        
+        # For polygon requests, the geometry must be flattened from [[lon1, lat1], [lon2, lat2], ...] 
+        # to [lon1, lat1, lon2, lat2, ...] as required by the OpenET API
+        if isinstance(geometry[0], list):
+            # Flatten the geometry list
+            flat_geometry = []
+            for point in geometry:
+                flat_geometry.extend(point)
+            geometry = flat_geometry
+            logger.info(f"Flattened polygon geometry for API request")
     
-    # Prepare request data
+    # Prepare request data according to official OpenET API documentation
     payload = {
         "date_range": [start_date, end_date],
         "interval": interval,
@@ -92,11 +111,17 @@ def call_openet_api(
         "variable": variable,
         "reference_et": reference_et,
         "units": units,
-        "file_format": "JSON"
+        "file_format": "JSON"  # Correct case per documentation
     }
     
+    # Add reducer parameter for polygon queries (required by the API)
+    if not is_point:
+        payload["reducer"] = "mean"  # Default to mean for polygon queries
+        logger.info(f"Added required 'reducer' parameter for polygon query")
+    
+    # Headers format according to official OpenET documentation
     headers = {
-        "Authorization": api_key,
+        "Authorization": api_key,  # No "Bearer" prefix
         "Content-Type": "application/json"
     }
     
@@ -104,18 +129,45 @@ def call_openet_api(
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            logger.info(f"Calling OpenET API ({attempt+1}/{max_retries})")
+            endpoint_type = "point" if is_point else "polygon"
+            logger.info(f"Calling OpenET API ({attempt+1}/{max_retries}) - Endpoint: {endpoint} (Type: {endpoint_type})")
+            logger.debug(f"Request payload: {json.dumps(payload)}")
+            
             response = requests.post(
                 endpoint, 
                 json=payload, 
                 headers=headers,
                 timeout=60  # 60 second timeout
             )
+            
+            # Log response status for debugging
+            logger.info(f"API response status: {response.status_code}")
+            
+            # Check response status and provide more detailed error logs
+            if response.status_code != 200:
+                error_message = response.text[:500] if response.text else "No error details provided"
+                logger.error(f"API error: Status {response.status_code}, Response: {error_message}")
+                
+                # Handle specific error codes
+                if response.status_code == 404:
+                    # This might be an endpoint configuration issue
+                    raise OpenETError(f"API endpoint not found (404): {endpoint}. Please verify API documentation for the correct endpoint.")
+                
+                if response.status_code == 401:
+                    raise OpenETError("Authentication failed: API key invalid or expired")
+                
+                # Check for geometry format errors
+                if response.status_code == 422 and "geometry" in error_message:
+                    raise OpenETError(f"Invalid geometry format: {error_message}. For polygons, ensure geometry is a flat list of coordinates and 'reducer' parameter is included.")
+                
+                # Let response.raise_for_status() handle other errors
+            
             response.raise_for_status()  # Raise exception for non-200 responses
             
             # Try to parse JSON response
             try:
                 data = response.json()
+                logger.info(f"API call successful, received response data")
                 return data
             except json.JSONDecodeError:
                 logger.error(f"Failed to decode JSON response: {response.text[:200]}...")
@@ -164,35 +216,58 @@ def parse_openet_response(response_data: Dict, variable: str = "ET") -> pd.DataF
         OpenETError: If response cannot be parsed
     """
     try:
-        # Check if response has a FeatureCollection structure
+        # According to OpenET documentation, responses can be in different formats
+        # Check for standard API response format first
+        timeseries = None
+        
+        # Check if response has a FeatureCollection structure (typical for polygon queries)
         if response_data.get("type") == "FeatureCollection" and "features" in response_data:
             # Extract timeseries from first feature's properties
             if len(response_data["features"]) > 0:
                 properties = response_data["features"][0].get("properties", {})
-                timeseries = properties.get("timeseries", [])
+                timeseries = properties.get("data", properties.get("timeseries", []))
             else:
                 raise OpenETError("No features found in API response")
-        else:
-            # Try to directly get timeseries if not in FeatureCollection format
+        
+        # Check for direct timeseries format (typical for point queries)
+        elif "data" in response_data:
+            timeseries = response_data.get("data", [])
+        
+        # Check for legacy format
+        elif "timeseries" in response_data:
             timeseries = response_data.get("timeseries", [])
-            
-            # If still not found, check if response itself is the timeseries list
-            if not timeseries and isinstance(response_data, list):
-                timeseries = response_data
+        
+        # Check if response itself is the timeseries list
+        elif isinstance(response_data, list):
+            timeseries = response_data
         
         # If no timeseries found
         if not timeseries:
+            logger.error(f"Unexpected API response format: {str(response_data)[:200]}...")
             raise OpenETError("No timeseries data found in API response")
         
         # Convert to DataFrame
         df = pd.DataFrame(timeseries)
         
-        # Ensure expected columns exist
-        if "date" not in df.columns:
+        # Handle possible column name variations
+        date_columns = ["date", "time", "timestamp"]
+        date_col = next((col for col in date_columns if col in df.columns), None)
+        
+        if not date_col:
             raise OpenETError("Date column missing from API response")
+            
+        # Rename date column to standardize
+        if date_col != "date":
+            df = df.rename(columns={date_col: "date"})
+            
+        # Check for variable
         if variable not in df.columns:
-            logger.warning(f"Variable {variable} not found in response. Available columns: {df.columns.tolist()}")
-            raise OpenETError(f"Variable {variable} not found in API response")
+            var_col = next((col for col in df.columns if col.upper() == variable.upper()), None)
+            if var_col:
+                df = df.rename(columns={var_col: variable})
+            else:
+                logger.warning(f"Variable {variable} not found in response. Available columns: {df.columns.tolist()}")
+                raise OpenETError(f"Variable {variable} not found in API response")
         
         # Convert date strings to datetime objects
         df["date"] = pd.to_datetime(df["date"])
@@ -228,14 +303,17 @@ def fetch_openet_data(
     model: str = "Ensemble",
     variable: str = "ET",
     units: str = "mm",
-    api_key: Optional[str] = None
+    api_key: Optional[str] = None,
+    reducer: str = "mean"
 ) -> pd.DataFrame:
     """
     Fetch ET data from OpenET API and return as a DataFrame.
     This is the main function to call from other modules.
     
     Args:
-        geometry: Point coordinates [lon, lat] or polygon [[[lon1, lat1], ...]]
+        geometry: Coordinates in WGS84 format:
+            - For point: [lon, lat]
+            - For polygon: [[lon1, lat1], [lon2, lat2], ...] (will be automatically flattened)
         start_date: Start date (string or datetime)
         end_date: End date (string or datetime)
         interval: Time interval ("daily" or "monthly")
@@ -243,12 +321,17 @@ def fetch_openet_data(
         variable: Variable to retrieve
         units: Units for the result
         api_key: OpenET API key
+        reducer: Method to reduce/aggregate values for polygon (mean, sum, etc.)
         
     Returns:
         pandas.DataFrame: DataFrame with date and variable columns
         
     Raises:
         OpenETError: If data cannot be retrieved or parsed
+        
+    Note:
+        For polygon requests, the geometry will be automatically flattened and a 
+        reducer parameter will be added to the request as required by the OpenET API.
     """
     # Convert dates to strings if they're datetime objects
     if isinstance(start_date, datetime):
@@ -256,27 +339,63 @@ def fetch_openet_data(
     if isinstance(end_date, datetime):
         end_date = end_date.strftime("%Y-%m-%d")
     
+    # ================================================================
+    # IMPORTANT: FUTURE DATES NOT SUPPORTED BY OPENET API
+    # ================================================================
+    # Check if the end date is in the future
+    today = datetime.now().date()
+    today_str = today.isoformat()
+    
+    # Convert string dates to date objects for comparison if needed
+    end_date_obj = end_date
+    if isinstance(end_date, str):
+        end_date_obj = datetime.fromisoformat(end_date).date()
+    
+    # Enforce that we never call the API with future dates
+    is_future_query = end_date_obj > today
+    
+    if is_future_query:
+        logger.warning(f"FUTURE DATE DETECTED: {end_date}. OpenET API does not support future dates.")
+        # Force end date to today
+        end_date = today_str
+        logger.info(f"Automatically adjusting end date to today: {today_str}")
+    
     try:
-        # Call the API
+        # STUB FOR FUTURE ENHANCEMENT: 
+        # In a future version, this is where we would implement ET forecasting
+        # For now, we only fetch historical data up to the present
+        
+        # Call the API with adjusted end date (never in the future)
         response_data = call_openet_api(
             geometry=geometry,
             start_date=start_date,
-            end_date=end_date,
+            end_date=end_date,  # This is guaranteed to not be in the future
             interval=interval,
             model=model,
             variable=variable,
             units=units,
-            api_key=api_key
+            api_key=api_key,
+            reducer=reducer
         )
         
         # Parse the response
         df = parse_openet_response(response_data, variable)
         
+        # Add a note about the original request if it was a future query
+        if is_future_query and not df.empty:
+            logger.info(f"Original request included a future end date: {end_date_obj.isoformat()}")
+            logger.info(f"Data was fetched up to: {df['date'].max().date().isoformat()}")
+        
         return df
     
     except OpenETError as e:
-        # Re-raise the custom exception
+        # No need to check for future date errors since we already handle that
+        # by adjusting the end_date before making the API call
+        
+        # Just log and re-raise the exception
+        logger.error(f"Error fetching data from OpenET: {str(e)}")
         raise
+    
     except Exception as e:
         # Wrap any other exceptions
         logger.exception("Unexpected error in fetch_openet_data")
