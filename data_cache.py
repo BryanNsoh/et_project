@@ -79,6 +79,15 @@ def save_cache(
     # Convert DataFrame to dictionary for JSON serialization
     key = geom_to_key(coords, start_date, end_date, interval, model, variable)
     
+    # Convert DataFrame dates to ISO format strings to ensure JSON serialization
+    data_copy = data.copy()
+    
+    # Convert any datetime columns to ISO format strings
+    for col in data_copy.columns:
+        if pd.api.types.is_datetime64_any_dtype(data_copy[col]):
+            # Convert timestamp column to ISO format strings
+            data_copy[col] = data_copy[col].dt.strftime('%Y-%m-%dT%H:%M:%S')
+    
     # Prepare data for serialization
     cache_data = {
         "metadata": {
@@ -90,7 +99,7 @@ def save_cache(
             "variable": variable,
             "cached_at": datetime.now().isoformat(),
         },
-        "data": data.to_dict(orient="records"),
+        "data": data_copy.to_dict(orient="records"),
     }
     
     filepath = os.path.join(CACHE_DIR, f"{key}.json")
@@ -99,14 +108,14 @@ def save_cache(
         # Write to a temporary file first, then rename for atomicity
         temp_filepath = filepath + ".tmp"
         with open(temp_filepath, "w") as f:
-            json.dump(cache_data, f)
+            json.dump(cache_data, f, default=str)  # Use default=str to handle any remaining non-serializable objects
         
         # Atomic rename to avoid partial writes
         os.replace(temp_filepath, filepath)
         logger.info(f"Cached data saved to {filepath}")
         return key
     except Exception as e:
-        logger.error(f"Failed to save cache: {e}")
+        logger.error(f"Failed to save cache: {str(e)}")
         # Clean up temp file if it exists
         if os.path.exists(temp_filepath):
             os.remove(temp_filepath)
