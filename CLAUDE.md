@@ -23,3 +23,6 @@
 - Write descriptive commit messages with a clear action verb
 - Do not include the name "Claude" or any AI assistant names in commit messages
 - Keep commit scope focused on related changes
+
+### Env Contents
+These variables are present in the .env of this project: OPENET_API_KEY(regular key that allows you to query openET) and GOOGLE_MAPS_KEY (permissions inclide: SDK for Android, Maps Elevation API, Maps Embed API, Geocoding API, Geolocation API, Maps JavaScript API, Roads API, Maps SDK for iOS, Time Zone API, Maps Static API, Street View Static API, Map Tiles API, Routes API, Navigation SDK, Address Validation API, Maps Platform Datasets API, Air Quality API, Solar API, Aerial View API, Places API (New), Street View Publish API, Pollen API, Route Optimization API, Places UI Kit)
