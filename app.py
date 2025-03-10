@@ -471,126 +471,90 @@ def render_sidebar():
     }
 
 def render_map_section():
-    
-    """Render the map section for field selection, including address search."""
+    """Optimized map section for neat alignment and better UI flow."""
     st.header("Field Selection")
-    
-    # Add search bar at the top, before the map
-    st.subheader("Search by Address")
-    col_search1, col_search2 = st.columns([3, 1])
-    
-    with col_search1:
-        address_query = st.text_input("Enter address:", "", key="address_query_input", 
-                                     placeholder="e.g., 402 West State Farm Road, North Platte, NE")
-    
-    with col_search2:
-        search_button_placeholder = st.empty()  # Placeholder for the button
-    
-    # Process address search
-    if address_query and GEOAPIFY_API_KEY:
-        # Query Geoapify Autocomplete
+
+    # Address input and locate button in aligned columns
+    address_col, button_col = st.columns([4, 1])
+    with address_col:
+        address_query = st.text_input("Search by Address", "", placeholder="402 West State Farm Road, North Platte, NE")
+    with button_col:
+        locate_clicked = st.button("Locate", key="address_search_button")
+
+    if locate_clicked and address_query and GEOAPIFY_API_KEY:
         geo_url = f"https://api.geoapify.com/v1/geocode/autocomplete?text={address_query}&apiKey={GEOAPIFY_API_KEY}"
         try:
             resp = requests.get(geo_url, timeout=10)
             resp.raise_for_status()
             features = resp.json().get("features", [])
-            
-            if not features:
-                st.warning("No address matches found.")
+
+            if features:
+                first_match = features[0]
+                lat, lon = first_match["properties"]["lat"], first_match["properties"]["lon"]
+                st.session_state['map_center'] = [lat, lon]
+                st.session_state['map_zoom'] = 18
+                st.experimental_rerun()
             else:
-                suggestions = [feat["properties"]["formatted"] for feat in features]
-                selected_addr = st.selectbox(
-                    "Select the correct address:",
-                    options=suggestions,
-                    key=f"geoapify_select_{address_query}"
-                )
-                
-                if search_button_placeholder.button("Locate Address", key=f"locate_{address_query}"):
-                    chosen = None
-                    for feat in features:
-                        if feat["properties"]["formatted"] == selected_addr:
-                            chosen = feat
-                            break
-                    if chosen:
-                        lat = chosen["properties"]["lat"]
-                        lon = chosen["properties"]["lon"]
-                        # Update map center & zoom
-                        st.session_state['map_center'] = [lat, lon]
-                        st.session_state['map_zoom'] = 18
-                        st.experimental_rerun()
+                st.warning("No address matches found.")
+
         except requests.exceptions.RequestException as e:
             st.error(f"Address lookup failed: {e}")
-    
-    elif address_query and not GEOAPIFY_API_KEY:
-        st.warning("No GEOAPIFY_API_KEY found in environment. Cannot perform address search.")
-    
-    # Map and instructions section
-    col1, col2 = st.columns([4, 1])
-    
-    with col1:
-        # Create and display the map
+
+    # Main layout with map on the left and controls on the right
+    map_col, control_col = st.columns([4, 1])
+
+    with map_col:
         m = create_map()
         map_data = st_folium(m, height=450, width="100%")
-        
-        # Process user drawings
-        if map_data and map_data.get("all_drawings") is not None:
+
+        if map_data and map_data.get("all_drawings"):
             drawings = map_data["all_drawings"]
             if drawings:
-                if len(drawings) > 1:
-                    st.info("Multiple shapes drawn. Using the most recent one.")
-                
                 last_drawing = drawings[-1]
                 geometry = last_drawing.get("geometry", {})
                 geom_type = geometry.get("type", "")
-                
-                if geom_type == "Point":
-                    coords = geometry.get("coordinates", [])
-                    st.session_state['user_polygon'] = coords
-                    st.session_state['geometry_metadata'] = {
-                        "source": "draw",
-                        "geometry_type": "point"
-                    }
-                elif geom_type in ["Polygon", "Rectangle"]:
+
+                if geom_type in ["Polygon", "Rectangle"]:
                     coords = geometry.get("coordinates", [[]])[0]
-                    
                     try:
                         validate_geometry(coords, "polygon")
                         area_sq_m = calculate_area(coords)
                         area_acres = area_sq_m * 0.000247105
-                        if area_acres > MAX_AREA_ACRES:
-                            st.error(f"Area exceeds maximum allowed size of {MAX_AREA_ACRES} acres. Please select a smaller area.")
-                        else:
+
+                        if area_acres <= MAX_AREA_ACRES:
                             st.session_state['user_polygon'] = coords
                             st.session_state['geometry_metadata'] = {
-                                "source": "draw",
                                 "geometry_type": "polygon",
                                 "area_acres": area_acres,
                                 "area_sq_m": area_sq_m
                             }
+                        else:
+                            st.error(f"Area exceeds limit of {MAX_AREA_ACRES} acres.")
                     except ValueError as e:
                         st.error(str(e))
-    
-    with col2:
-        # Instructions box - now more compact
+
+    with control_col:
+        # Compact and neat instructions
         st.markdown("""
-        <div class="instructions-box">
-        <h3>How to Select a Field</h3>
-        <ol>
-            <li>Use the rectangle ⬜ or polygon 🔺 tool</li>
-            <li>Draw your field boundary</li>
-            <li>Once drawn, the field will be highlighted</li>
-        </ol>
+        <div class="instructions-box" style="font-size:0.9rem;">
+            <b>How to Select a Field:</b>
+            <ol style="padding-left:1rem;">
+                <li>Use rectangle ⬜ or polygon 🔺 tools.</li>
+                <li>Draw your boundary.</li>
+                <li>Field highlights after drawing.</li>
+            </ol>
         </div>
         """, unsafe_allow_html=True)
-        
-        # Clear selection button
-        if st.session_state['user_polygon'] is not None and st.session_state['geometry_metadata'] is not None:
+
+        # Buttons clearly stacked
+        if st.session_state['user_polygon']:
             if st.button("Clear Selection", key="clear_selection"):
                 st.session_state['user_polygon'] = None
                 st.session_state['geometry_metadata'] = None
-                st.session_state['et_data'] = None
-                st.session_state['last_query_params'] = None
                 st.experimental_rerun()
+
+            if st.button("Fetch ET Data", key="fetch_data"):
+                fetch_data(initialize_session_state())
 
 
 def fetch_data(params):
