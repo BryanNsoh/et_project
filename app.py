@@ -40,7 +40,7 @@ DEFAULT_CENTER = [37.0, -120.0]  # California Central Valley
 DEFAULT_ZOOM = 6
 MAX_AREA_ACRES = 50000
 
-# Attempt to load API keys from environment (including Geoapify if present)
+# Attempt to load API keys from environment
 OPENET_API_KEY = os.environ.get('OPENET_API_KEY', '')
 GEOAPIFY_API_KEY = os.environ.get('GEOAPIFY_API_KEY', '')
 
@@ -133,7 +133,7 @@ def initialize_session_state():
     if 'end_date' not in st.session_state:
         st.session_state['end_date'] = today.isoformat()
     
-    # Default map center & zoom (can be updated by address search)
+    # Default map center & zoom
     if 'map_center' not in st.session_state:
         st.session_state['map_center'] = DEFAULT_CENTER
     if 'map_zoom' not in st.session_state:
@@ -262,7 +262,8 @@ def render_map_section():
         
         # Address search (optional)
         st.markdown("**Optional: Search by Address**")
-        address_query = st.text_input("Enter address (autocomplete via Geoapify):", "")
+        # Using a key so the text input persists properly
+        address_query = st.text_input("Enter address (autocomplete via Geoapify):", "", key="address_query_input")
         
         if address_query and GEOAPIFY_API_KEY:
             # Query Geoapify autocomplete
@@ -275,9 +276,15 @@ def render_map_section():
                 if not features:
                     st.warning("No address matches found.")
                 else:
-                    # Build suggestion labels
                     suggestions = [feat["properties"]["formatted"] for feat in features]
-                    selected_addr = st.selectbox("Select the correct address:", options=suggestions)
+                    # Provide a dynamic key so each new address query resets the selection
+                    selectbox_key = f"geoapify_selectbox_{address_query}"
+                    
+                    selected_addr = st.selectbox(
+                        "Select the correct address:",
+                        options=suggestions,
+                        key=selectbox_key
+                    )
                     
                     if st.button("Locate"):
                         # Find that feature
@@ -375,7 +382,7 @@ def render_data_parameters():
         st.session_state['end_date'] = st.session_state['end_date_input'].isoformat()
     
     today = datetime.now().date()
-    future_date = today + timedelta(days=365*10)  # allow selection up to 10 years future
+    future_date = today + timedelta(days=365*10)
     
     with col1:
         default_start = datetime.fromisoformat(st.session_state['start_date']).date()
@@ -405,11 +412,7 @@ def render_data_parameters():
             st.warning("FUTURE DATES NOT SUPPORTED: The OpenET API does not return data beyond today's date.")
     
     with col3:
-        interval = st.selectbox(
-            "Data Interval", 
-            options=["daily", "monthly"],
-            index=0
-        )
+        interval = st.selectbox("Data Interval", ["daily", "monthly"], index=0)
     
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -442,7 +445,6 @@ def render_data_parameters():
         if not api_key:
             st.warning("An API key is required to fetch data from OpenET. Sign up at https://etdata.org")
     
-    # Prepare parameters for data fetch
     current_params = (
         str(st.session_state['user_polygon']), 
         start_date.isoformat(),
@@ -453,7 +455,6 @@ def render_data_parameters():
         units
     )
     
-    # Fetch button
     fetch_disabled = (
         st.session_state['user_polygon'] is None or 
         not st.session_state['api_key']
@@ -465,7 +466,8 @@ def render_data_parameters():
         elif st.session_state['last_query_params'] == current_params and st.session_state['et_data'] is not None:
             st.success("Using previously fetched data. (Parameters unchanged.)")
         else:
-            with st.spinner("Fetching data from OpenET..."):
+            # "Sexy" spinner message here
+            with st.spinner("🚀  Beaming up data from outer space, please hold on..."):
                 try:
                     df = get_et_data_cached(
                         geometry=st.session_state['user_polygon'],
@@ -511,7 +513,6 @@ def render_results(start_date, end_date, interval, model, variable, units):
         fig.update_layout(hovermode="x unified")
         
         if interval == "daily" and len(df) > 31:
-            # Show monthly aggregation side-by-side
             df_monthly = df.copy()
             df_monthly['month'] = df_monthly['date'].dt.to_period('M')
             monthly_values = df_monthly.groupby('month')[variable].sum().reset_index()
@@ -548,7 +549,7 @@ def render_results(start_date, end_date, interval, model, variable, units):
         if mode == "threshold":
             threshold = st.number_input("Depletion Threshold (mm)", min_value=10, max_value=100, value=30)
         else:
-            threshold = 25  # default, not used for daily
+            threshold = 25
         
         colA, colB = st.columns(2)
         with colA:
@@ -560,7 +561,12 @@ def render_results(start_date, end_date, interval, model, variable, units):
                 index=0 if units == "mm" else 1
             )
         
-        rain_col = "PR" if "PR" in df.columns else "Rain" if "Rain" in df.columns else None
+        # If the data has a 'PR' column or 'Rain' column, we can use it
+        rain_col = None
+        if "PR" in df.columns:
+            rain_col = "PR"
+        elif "Rain" in df.columns:
+            rain_col = "Rain"
         
         try:
             recommendation = get_irrigation_recommendation(
