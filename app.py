@@ -1,5 +1,5 @@
 """
-OpenET Irrigation Advisory - Streamlit App (Redesigned)
+OpenET Irrigation Advisory - Streamlit App (With Restored Address Search)
 """
 import os
 import streamlit as st
@@ -18,7 +18,7 @@ import requests
 # Load local modules
 from openet_api import fetch_openet_data, OpenETError, load_api_key
 from data_cache import load_cache, save_cache
-from irrigation import get_irrigation_recommendation, summarize_irrigation_needs
+from irrigation import get_irrigation_recommendation
 from utils import validate_geometry, calculate_area, format_coordinates_for_display
 
 # Load environment variables from .env file
@@ -30,12 +30,15 @@ logger = logging.getLogger(__name__)
 
 # App configuration
 APP_TITLE = "OpenET Irrigation Advisory"
-DEFAULT_CENTER = [37.0, -120.0]  # California Central Valley
+# Default center: 402 West State Farm Road, North Platte, NE
+DEFAULT_CENTER = [41.121092, -100.768147]  
 DEFAULT_ZOOM = 6
 MAX_AREA_ACRES = 50000
 
 # Attempt to load API keys from environment
 OPENET_API_KEY = os.environ.get('OPENET_API_KEY', '')
+# IMPORTANT: for address search
+GEOAPIFY_API_KEY = os.environ.get('GEOAPIFY_API_KEY', '')
 
 # Set page configuration with custom theme colors
 st.set_page_config(
@@ -45,30 +48,68 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS for styling
+# --- CUSTOM CSS (Cleaned up) ---
 st.markdown("""
 <style>
-    .main .block-container {padding-top: 2rem;}
-    .stApp {background-color: #fafcff;}
-    h1 {color: #1e5b94;}
-    h2 {color: #1e5b94; border-bottom: 1px solid #e0e0e0; padding-bottom: 0.5rem;}
-    h3 {color: #1e5b94; font-size: 1.3rem;}
-    .stButton>button {background-color: #1e5b94; color: white;}
-    .stButton>button:hover {background-color: #164576;}
-    .st-bb {border-bottom-color: #1e5b94;}
-    .st-at {background-color: #1e5b94;}
-    
+    /* Space around main container */
+    .main .block-container {
+        padding-top: 2rem;
+    }
+
+    /* Headings */
+    h1 { color: #1e5b94; }
+    h2 {
+        color: #1e5b94;
+        border-bottom: 1px solid #e0e0e0;
+        padding-bottom: 0.5rem;
+    }
+    h3 { color: #1e5b94; font-size: 1.3rem; }
+
+    /* Button styling */
+    .stButton>button {
+        background-color: #1e5b94;
+        color: white;
+    }
+    .stButton>button:hover {
+        background-color: #164576;
+    }
+
+    /* Additional Streamlit color classes */
+    .st-bb { border-bottom-color: #1e5b94; }
+    .st-at { background-color: #1e5b94; }
+
     /* Sidebar styling */
-    [data-testid="stSidebar"] {background-color: #173d5e;}
-    [data-testid="stSidebar"] .st-bq {color: white !important;}
-    [data-testid="stSidebar"] .st-c0 {color: #b8d1e6 !important;}
-    [data-testid="stSidebar"] h1 {color: white !important;}
-    [data-testid="stSidebar"] h2 {color: white !important; border-color: #315b7c !important;}
-    [data-testid="stSidebar"] h3 {color: white !important;}
-    [data-testid="stSidebar"] .stSubheader {color: #8aadce !important; font-weight: 600 !important; margin-top: 20px !important;}
-    [data-testid="stSidebar"] p {color: #e0eaf2 !important;}
-    [data-testid="stSidebar"] label {color: #e0eaf2 !important;}
-    
+    [data-testid="stSidebar"] {
+        background-color: #173d5e;
+    }
+    [data-testid="stSidebar"] .st-bq {
+        color: white !important;
+    }
+    [data-testid="stSidebar"] .st-c0 {
+        color: #b8d1e6 !important;
+    }
+    [data-testid="stSidebar"] h1 {
+        color: white !important;
+    }
+    [data-testid="stSidebar"] h2 {
+        color: white !important;
+        border-color: #315b7c !important;
+    }
+    [data-testid="stSidebar"] h3 {
+        color: white !important;
+    }
+    [data-testid="stSidebar"] .stSubheader {
+        color: #8aadce !important;
+        font-weight: 600 !important;
+        margin-top: 20px !important;
+    }
+    [data-testid="stSidebar"] p {
+        color: #e0eaf2 !important;
+    }
+    [data-testid="stSidebar"] label {
+        color: #e0eaf2 !important;
+    }
+
     /* Field selection box */
     .selected-field-box {
         background-color: #1e5b94;
@@ -86,7 +127,7 @@ st.markdown("""
         color: white;
         margin-bottom: 0.5rem;
     }
-    
+
     /* Instructions box */
     .instructions-box {
         background-color: #173d5e;
@@ -108,7 +149,7 @@ st.markdown("""
         margin-bottom: 0.5rem;
         color: white;
     }
-    
+
     /* Status boxes */
     .status-box {
         padding: 1rem;
@@ -132,27 +173,16 @@ st.markdown("""
         background-color: #fef2f1;
         border-left: 5px solid #ef564d;
     }
-    
-    /* Expander styling */
-    .streamlit-expanderHeader {
-        background-color: #f0f6fb;
-        border-radius: 0.3rem;
-    }
-    .streamlit-expanderContent {
-        border-left: 1px solid #e0e8f0;
-        border-right: 1px solid #e0e8f0;
-        border-bottom: 1px solid #e0e8f0;
-        border-radius: 0 0 0.3rem 0.3rem;
-        padding: 1rem;
-    }
-    
+
     /* Space optimization */
-    section[data-testid="stSidebar"] > div {padding-top: 1rem;}
-    section[data-testid="stSidebar"] .block-container {padding-top: 0;}
-    div.stTabs [data-baseweb="tab-list"] button [data-testid="stMarkdownContainer"] p {font-size: 1rem;}
-    div.stTabs [data-baseweb="tab-list"] {gap: 2px;}
-    
-    /* Button styling */
+    section[data-testid="stSidebar"] > div {
+        padding-top: 1rem;
+    }
+    section[data-testid="stSidebar"] .block-container {
+        padding-top: 0;
+    }
+
+    /* General button styling for the app */
     div.stButton > button:first-child {
         border-radius: 4px;
         font-weight: 500;
@@ -162,16 +192,10 @@ st.markdown("""
     div.stButton > button:hover {
         box-shadow: 0 4px 8px rgba(0,0,0,0.1);
     }
-    .clear-button > button:first-child {
-        background-color: #6c8fb3 !important;
-    }
-    .clear-button > button:hover {
-        background-color: #597a9e !important;
-    }
 </style>
 """, unsafe_allow_html=True)
+# --- END CUSTOM CSS ---
 
-# Streamlit Cache for API calls
 @st.cache_data(ttl=3600*24)  # Cache for 24 hours
 def get_et_data_cached(
     geometry: List,
@@ -447,15 +471,66 @@ def render_sidebar():
     }
 
 def render_map_section():
-    """Render the map section for field selection."""
+    
+    """Render the map section for field selection, including address search."""
     st.header("Field Selection")
     
-    # Create and display the map
-    col1, col2 = st.columns([3, 1])
+    # Add search bar at the top, before the map
+    st.subheader("Search by Address")
+    col_search1, col_search2 = st.columns([3, 1])
+    
+    with col_search1:
+        address_query = st.text_input("Enter address:", "", key="address_query_input", 
+                                     placeholder="e.g., 402 West State Farm Road, North Platte, NE")
+    
+    with col_search2:
+        search_button_placeholder = st.empty()  # Placeholder for the button
+    
+    # Process address search
+    if address_query and GEOAPIFY_API_KEY:
+        # Query Geoapify Autocomplete
+        geo_url = f"https://api.geoapify.com/v1/geocode/autocomplete?text={address_query}&apiKey={GEOAPIFY_API_KEY}"
+        try:
+            resp = requests.get(geo_url, timeout=10)
+            resp.raise_for_status()
+            features = resp.json().get("features", [])
+            
+            if not features:
+                st.warning("No address matches found.")
+            else:
+                suggestions = [feat["properties"]["formatted"] for feat in features]
+                selected_addr = st.selectbox(
+                    "Select the correct address:",
+                    options=suggestions,
+                    key=f"geoapify_select_{address_query}"
+                )
+                
+                if search_button_placeholder.button("Locate Address", key=f"locate_{address_query}"):
+                    chosen = None
+                    for feat in features:
+                        if feat["properties"]["formatted"] == selected_addr:
+                            chosen = feat
+                            break
+                    if chosen:
+                        lat = chosen["properties"]["lat"]
+                        lon = chosen["properties"]["lon"]
+                        # Update map center & zoom
+                        st.session_state['map_center'] = [lat, lon]
+                        st.session_state['map_zoom'] = 18
+                        st.experimental_rerun()
+        except requests.exceptions.RequestException as e:
+            st.error(f"Address lookup failed: {e}")
+    
+    elif address_query and not GEOAPIFY_API_KEY:
+        st.warning("No GEOAPIFY_API_KEY found in environment. Cannot perform address search.")
+    
+    # Map and instructions section
+    col1, col2 = st.columns([4, 1])
     
     with col1:
+        # Create and display the map
         m = create_map()
-        map_data = st_folium(m, height=450, width=700)
+        map_data = st_folium(m, height=450, width="100%")
         
         # Process user drawings
         if map_data and map_data.get("all_drawings") is not None:
@@ -494,46 +569,29 @@ def render_map_section():
                             }
                     except ValueError as e:
                         st.error(str(e))
-                        
+    
     with col2:
+        # Instructions box - now more compact
         st.markdown("""
         <div class="instructions-box">
         <h3>How to Select a Field</h3>
         <ol>
-            <li>Use the rectangle ⬜ or polygon 🔺 tool from the toolbar</li>
-            <li>Draw your field boundary on the map</li>
-            <li>Once drawn, the field will be highlighted in blue</li>
+            <li>Use the rectangle ⬜ or polygon 🔺 tool</li>
+            <li>Draw your field boundary</li>
+            <li>Once drawn, the field will be highlighted</li>
         </ol>
         </div>
         """, unsafe_allow_html=True)
         
-        # Display info about selected field if any
+        # Clear selection button
         if st.session_state['user_polygon'] is not None and st.session_state['geometry_metadata'] is not None:
-            coords = st.session_state['user_polygon']
-            metadata = st.session_state['geometry_metadata']
-            
-            field_info = format_coordinates_for_display(coords)
-            area_info = ""
-            if metadata.get("geometry_type") == "polygon" and "area_acres" in metadata:
-                area_info = f"<p><strong>Area:</strong> {metadata['area_acres']:.2f} acres</p>"
-            
-            st.markdown(f"""
-            <div class="selected-field-box">
-                <h3>Selected Field</h3>
-                <p>{field_info}</p>
-                {area_info}
-            </div>
-            """, unsafe_allow_html=True)
-            
-            # Use the clear-button class for styling
-            st.markdown('<div class="clear-button">', unsafe_allow_html=True)
             if st.button("Clear Selection", key="clear_selection"):
                 st.session_state['user_polygon'] = None
                 st.session_state['geometry_metadata'] = None
                 st.session_state['et_data'] = None
                 st.session_state['last_query_params'] = None
                 st.experimental_rerun()
-            st.markdown('</div>', unsafe_allow_html=True)
+
 
 def fetch_data(params):
     """Fetch ET data based on parameters."""
@@ -769,7 +827,7 @@ def render_results(params):
                         fig_cum.add_trace(go.Scatter(
                             x=df_cum['date'],
                             y=df_cum['Cumulative_Rain'],
-                            mode='lines', name=f"Cumulative Rain",
+                            mode='lines', name="Cumulative Rain",
                             line=dict(color='#13ab5c', width=2)
                         ))
                         fig_cum.add_trace(go.Scatter(
@@ -827,7 +885,7 @@ def main():
     
     # Footer
     st.markdown("---")
-    st.caption("Powered by [OpenET](https://openetdata.org) | ESRI World Imagery basemap")
+    st.caption("Powered by [OpenET](https://openetdata.org) | ESRI World Imagery basemap | Geoapify address search")
 
 if __name__ == "__main__":
     main()
