@@ -1,6 +1,3 @@
-"""
-OpenET Irrigation Advisory - Streamlit App (With Restored Address Search)
-"""
 import os
 import streamlit as st
 import folium
@@ -10,7 +7,7 @@ import pandas as pd
 from datetime import datetime, timedelta
 import plotly.express as px
 import plotly.graph_objects as go
-from typing import List, Dict, Tuple, Optional, Union, Any
+from typing import List
 import logging
 from dotenv import load_dotenv
 import requests
@@ -31,7 +28,7 @@ logger = logging.getLogger(__name__)
 # App configuration
 APP_TITLE = "OpenET Irrigation Advisory"
 # Default center: 402 West State Farm Road, North Platte, NE
-DEFAULT_CENTER = [41.121092, -100.768147]  
+DEFAULT_CENTER = [41.121092, -100.768147]
 DEFAULT_ZOOM = 6
 MAX_AREA_ACRES = 50000
 
@@ -221,7 +218,6 @@ def get_et_data_cached(
     if df is not None:
         return df
     
-    # If not in local cache, call OpenET API
     try:
         df = fetch_openet_data(
             geometry=geometry,
@@ -242,7 +238,6 @@ def get_et_data_cached(
             variable=variable
         )
         return df
-    
     except OpenETError as e:
         st.cache_data.clear()
         raise e
@@ -254,16 +249,12 @@ def initialize_session_state():
     
     if 'user_polygon' not in st.session_state:
         st.session_state['user_polygon'] = None
-    
     if 'geometry_metadata' not in st.session_state:
         st.session_state['geometry_metadata'] = None
-    
     if 'et_data' not in st.session_state:
         st.session_state['et_data'] = None
-    
     if 'last_query_params' not in st.session_state:
         st.session_state['last_query_params'] = None
-    
     if 'api_key' not in st.session_state:
         st.session_state['api_key'] = OPENET_API_KEY  # pre-load if found
     
@@ -329,7 +320,6 @@ def create_map(center=None, zoom=None):
     # If a polygon is already selected, show it on the map
     if st.session_state['user_polygon'] is not None:
         coords = st.session_state['user_polygon']
-        # It's a polygon if not simply [lon, lat]
         if not isinstance(coords[0], (int, float)):
             folium.Polygon(
                 locations=coords,
@@ -353,7 +343,6 @@ def render_sidebar():
     """Render the sidebar with app information and data controls."""
     st.sidebar.title("OpenET Irrigation Advisory")
     
-    # API key input
     with st.sidebar.expander("API Key Settings", expanded=False):
         api_key = st.text_input(
             "OpenET API Key", 
@@ -365,10 +354,8 @@ def render_sidebar():
         if not api_key:
             st.warning("API key required to fetch data")
             
-    # Time period selection
     st.sidebar.subheader("Time Period")
     
-    # Use session state for date inputs
     def update_start_date():
         st.session_state['start_date'] = st.session_state['start_date_input'].isoformat()
     def update_end_date():
@@ -403,7 +390,6 @@ def render_sidebar():
     if end_date > today:
         st.sidebar.warning("The OpenET API does not return data beyond today's date.")
     
-    # Data parameters in a collapsible section
     with st.sidebar.expander("ET Settings", expanded=False):
         st.subheader("Data Parameters")
         interval = st.selectbox("Data Interval", ["daily", "monthly"], index=0)
@@ -423,18 +409,14 @@ def render_sidebar():
             index=0
         )
     
-    # Irrigation settings
     if st.session_state['et_data'] is not None:
         st.sidebar.subheader("Irrigation Settings")
         mode = st.sidebar.selectbox("Irrigation Mode", ["daily", "threshold"], index=0)
-        
         if mode == "threshold":
             threshold = st.sidebar.number_input("Depletion Threshold (mm)", min_value=10, max_value=100, value=30)
         else:
             threshold = 25
-        
         efficiency = st.sidebar.slider("Irrigation Efficiency (%)", 50, 100, 85)
-        
         display_units = st.sidebar.selectbox(
             "Display Units", 
             options=["mm", "inches"],
@@ -446,7 +428,6 @@ def render_sidebar():
         efficiency = 85
         display_units = units
     
-    # App information
     with st.sidebar.expander("About", expanded=False):
         st.markdown("""
         This app uses [OpenET](https://etdata.org) data to provide irrigation 
@@ -473,21 +454,13 @@ def render_sidebar():
 
 def render_map_section():
     """
-    Restored multi-match Geoapify address search:
-    1. User hits 'Search' to get potential matches
-    2. If multiple matches exist, user picks from dropdown
-    3. 'Locate Address' button re-centers map on chosen match
+    Simplified Geoapify address search:
+    Automatically uses the first address match to re-center the map.
     """
     st.header("Field Selection")
 
-    # We store possible address matches in session_state for user to pick from
-    if 'address_candidates' not in st.session_state:
-        st.session_state['address_candidates'] = []
-
-    # Row: Address Input + Search Button
     address_col, button_col = st.columns([4, 1])
     with address_col:
-        # Provide a minimal label to avoid warnings, hide it visually:
         address_query = st.text_input(
             "Address Input",
             "",
@@ -497,68 +470,43 @@ def render_map_section():
     with button_col:
         search_clicked = st.button("Search", key="address_search_button")
 
-    # If user clicked 'Search' and there's an address & API key
     if search_clicked and address_query and GEOAPIFY_API_KEY:
         geo_url = f"https://api.geoapify.com/v1/geocode/autocomplete?text={address_query}&apiKey={GEOAPIFY_API_KEY}"
         try:
             resp = requests.get(geo_url, timeout=10)
             resp.raise_for_status()
             features = resp.json().get("features", [])
-
             if not features:
                 st.warning("No address matches found.")
-                st.session_state['address_candidates'] = []
             else:
-                # store all matches
-                st.session_state['address_candidates'] = features
-
+                # Automatically use the first address candidate
+                first_candidate = features[0]
+                lat = first_candidate["properties"]["lat"]
+                lon = first_candidate["properties"]["lon"]
+                st.session_state['map_center'] = [lat, lon]
+                st.session_state['map_zoom'] = 18
+                st.experimental_rerun()
         except requests.exceptions.RequestException as e:
             st.error(f"Address lookup failed: {e}")
     elif search_clicked and not GEOAPIFY_API_KEY:
         st.warning("No GEOAPIFY_API_KEY found in environment. Cannot perform address search.")
 
-    # If we have multiple (or single) address candidates, let user pick
-    if st.session_state['address_candidates']:
-        suggestions = [feat["properties"]["formatted"] for feat in st.session_state['address_candidates']]
-        selected_addr = st.selectbox("Select the correct match:", suggestions)
-        locate_clicked = st.button("Locate Address")
-        if locate_clicked:
-            chosen = None
-            for feat in st.session_state['address_candidates']:
-                if feat["properties"]["formatted"] == selected_addr:
-                    chosen = feat
-                    break
-            if chosen:
-                lat = chosen["properties"]["lat"]
-                lon = chosen["properties"]["lon"]
-                # Update map center & zoom
-                st.session_state['map_center'] = [lat, lon]
-                st.session_state['map_zoom'] = 18
-                # Clear address matches so the dropdown goes away next time
-                st.session_state['address_candidates'] = []
-                st.experimental_rerun()
-
-    # Now display the Folium map + instructions to draw or clear
     map_col, control_col = st.columns([4, 1])
     with map_col:
         m = create_map()
         map_data = st_folium(m, height=450, width="100%")
-
-        # If user drew a shape
         if map_data and map_data.get("all_drawings"):
             drawings = map_data["all_drawings"]
             if drawings:
                 last_drawing = drawings[-1]
                 geometry = last_drawing.get("geometry", {})
                 geom_type = geometry.get("type", "")
-
                 if geom_type in ["Polygon", "Rectangle"]:
                     coords = geometry.get("coordinates", [[]])[0]
                     try:
                         validate_geometry(coords, "polygon")
                         area_sq_m = calculate_area(coords)
                         area_acres = area_sq_m * 0.000247105
-
                         if area_acres <= MAX_AREA_ACRES:
                             st.session_state['user_polygon'] = coords
                             st.session_state['geometry_metadata'] = {
@@ -570,9 +518,7 @@ def render_map_section():
                             st.error(f"Area exceeds limit of {MAX_AREA_ACRES} acres.")
                     except ValueError as e:
                         st.error(str(e))
-
     with control_col:
-        # Instructions box
         st.markdown("""
         <div class="instructions-box" style="font-size:0.9rem;">
             <b>How to Select a Field:</b>
@@ -583,8 +529,6 @@ def render_map_section():
             </ol>
         </div>
         """, unsafe_allow_html=True)
-
-        # If a polygon is chosen, show buttons to clear or fetch
         if st.session_state['user_polygon']:
             if st.button("Clear Selection", key="clear_selection"):
                 st.session_state['user_polygon'] = None
@@ -592,25 +536,19 @@ def render_map_section():
                 st.session_state['et_data'] = None
                 st.session_state['last_query_params'] = None
                 st.experimental_rerun()
-
-            # Also keep the “Fetch ET Data” button here if needed
             if st.button("Fetch ET Data", key="fetch_data"):
                 fetch_data(initialize_session_state())
-
 
 def fetch_data(params):
     """Fetch ET data based on parameters."""
     if st.session_state['user_polygon'] is None:
         st.warning("Please select a field on the map first.")
         return
-    
     if not st.session_state['api_key']:
         st.warning("An API key is required to fetch data from OpenET. Please enter your API key in the sidebar.")
         return
-    
     start_date = params['start_date']
     end_date = params['end_date']
-    
     current_params = (
         str(st.session_state['user_polygon']), 
         start_date.isoformat(),
@@ -620,16 +558,12 @@ def fetch_data(params):
         params['variable'],
         params['units']
     )
-    
     if st.session_state['last_query_params'] == current_params and st.session_state['et_data'] is not None:
         st.success("Using previously fetched data.")
         return
-    
-    # Show processing message
     with st.spinner("Retrieving data from satellite measurements..."):
         try:
             today = datetime.now().date()
-            
             df = get_et_data_cached(
                 geometry=st.session_state['user_polygon'],
                 start_date=start_date.isoformat(),
@@ -639,14 +573,12 @@ def fetch_data(params):
                 variable=params['variable'],
                 units=params['units']
             )
-            
             if df is None or df.empty:
                 st.error("No data returned. This may be due to being outside the coverage area or no data for that period.")
             else:
                 st.session_state['et_data'] = df
                 st.session_state['last_query_params'] = current_params
                 st.success(f"Data retrieved: {len(df)} records from {start_date} to {min(end_date, today)}")
-                
         except OpenETError as e:
             st.error(f"Error fetching data: {str(e)}")
         except Exception as e:
@@ -656,7 +588,6 @@ def render_results(params):
     """Render results and irrigation recommendations."""
     if st.session_state['et_data'] is None:
         return
-    
     df = st.session_state['et_data']
     variable = params['variable']
     interval = params['interval']
@@ -669,11 +600,7 @@ def render_results(params):
     efficiency = params['efficiency']
     
     st.header("Results")
-    
-    # ET Visualization
     st.subheader("ET Time-Series")
-    
-    # Create basic line chart
     fig = px.line(
         df, 
         x='date', 
@@ -696,17 +623,12 @@ def render_results(params):
             title_font=dict(size=14)
         )
     )
-    
-    # If daily data, add monthly aggregation
     if interval == "daily" and len(df) > 31:
         st.plotly_chart(fig, use_container_width=True)
-        
-        # Monthly aggregation
         df_monthly = df.copy()
         df_monthly['month'] = df_monthly['date'].dt.to_period('M')
         monthly_values = df_monthly.groupby('month')[variable].sum().reset_index()
         monthly_values['month'] = monthly_values['month'].dt.to_timestamp()
-        
         fig2 = px.bar(
             monthly_values, 
             x='month', 
@@ -732,7 +654,6 @@ def render_results(params):
     else:
         st.plotly_chart(fig, use_container_width=True)
     
-    # Basic summary metrics
     col1, col2, col3, col4 = st.columns(4)
     with col1:
         st.metric("Total", f"{df[variable].sum():.1f} {units}")
@@ -743,10 +664,7 @@ def render_results(params):
     with col4:
         st.metric("Count", f"{len(df)}")
     
-    # Irrigation Recommendation
     st.subheader("Irrigation Recommendation")
-    
-    # If the data has a 'PR' or 'Rain' column, use it
     rain_col = None
     if "PR" in df.columns:
         rain_col = "PR"
@@ -763,7 +681,6 @@ def render_results(params):
             rain_col=rain_col,
             units=display_units
         )
-        
         if recommendation["status"] == "success":
             st.markdown(f"""
             <div class="status-box info-box">
@@ -771,7 +688,6 @@ def render_results(params):
                 {recommendation["recommendation"]}
             </div>
             """, unsafe_allow_html=True)
-            
             st.markdown(f"""
             <div class="status-box success-box">
                 <h4>Summary</h4>
@@ -781,11 +697,8 @@ def render_results(params):
                 Total irrigation need: {recommendation["total_irrigation"]:.1f} {display_units}</p>
             </div>
             """, unsafe_allow_html=True)
-            
-            # If threshold mode, show schedule
             if mode == "threshold" and "schedule" in recommendation and recommendation["schedule"]:
                 sched_df = pd.DataFrame(recommendation["schedule"])
-                
                 st.markdown("#### Irrigation Schedule")
                 fig_sched = go.Figure(data=[
                     go.Table(
@@ -804,8 +717,6 @@ def render_results(params):
                 ])
                 fig_sched.update_layout(margin=dict(l=0, r=0, b=0, t=0))
                 st.plotly_chart(fig_sched, use_container_width=True)
-                
-                # Cumulative chart if daily
                 if interval == "daily":
                     df_cum = df.copy()
                     df_cum['Cumulative_ET'] = df_cum[variable].cumsum()
@@ -813,14 +724,11 @@ def render_results(params):
                         df_cum['Net_ET'] = (df_cum[variable] - df_cum[rain_col]).clip(lower=0)
                         df_cum['Cumulative_Net_ET'] = df_cum['Net_ET'].cumsum()
                         df_cum['Cumulative_Rain'] = df_cum[rain_col].cumsum()
-                    
-                    # Convert units if needed
                     if display_units != units:
                         conv = 1/25.4 if display_units == "inches" else 25.4
                         for col in ['Cumulative_ET','Net_ET','Cumulative_Net_ET','Cumulative_Rain']:
                             if col in df_cum.columns:
                                 df_cum[col] = df_cum[col] * conv
-                    
                     fig_cum = go.Figure()
                     fig_cum.add_trace(go.Scatter(
                         x=df_cum['date'],
@@ -859,37 +767,23 @@ def render_results(params):
                     st.plotly_chart(fig_cum, use_container_width=True)
         else:
             st.error(recommendation["message"])
-    
     except Exception as e:
         st.error(f"Error generating irrigation recommendation: {str(e)}")
 
 def main():
     """Main Streamlit app entry point."""
     initialize_session_state()
-    
-    # Render title and brief description
     st.title(APP_TITLE)
     st.markdown("Satellite-based irrigation recommendations for optimizing water use in agriculture")
-    
-    # Render sidebar with controls
     params = render_sidebar()
-    
-    # Render map section for field selection & multi-match address search
     render_map_section()
-    
-    # If a user_polygon exists, show a fetch button (in the old UI layout).
-    # If you'd rather rely on the 'Fetch ET Data' in the instructions column, you can remove this block.
     if st.session_state['user_polygon'] is not None:
         fetch_button_col1, fetch_button_col2 = st.columns([1, 3])
         with fetch_button_col1:
             if st.button("Fetch ET Data", key="fetch_button", type="primary"):
                 fetch_data(params)
-        
-        # Render results if data exists
         if st.session_state['et_data'] is not None:
             render_results(params)
-    
-    # Footer
     st.markdown("---")
     st.caption("Powered by [OpenET](https://openetdata.org) | ESRI World Imagery basemap | Geoapify address search")
 
