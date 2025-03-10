@@ -13,6 +13,7 @@ import plotly.graph_objects as go
 from typing import List, Dict, Tuple, Optional, Union, Any
 import logging
 from dotenv import load_dotenv
+import requests
 
 # Load local modules
 from openet_api import fetch_openet_data, OpenETError, load_api_key
@@ -39,6 +40,10 @@ DEFAULT_CENTER = [37.0, -120.0]  # California Central Valley
 DEFAULT_ZOOM = 6
 MAX_AREA_ACRES = 50000
 
+# Attempt to load API keys from environment (including Geoapify if present)
+OPENET_API_KEY = os.environ.get('OPENET_API_KEY', '')
+GEOAPIFY_API_KEY = os.environ.get('GEOAPIFY_API_KEY', '')
+
 # Set page configuration
 st.set_page_config(
     page_title=APP_TITLE,
@@ -61,7 +66,6 @@ def get_et_data_cached(
     """
     Cached function to get ET data from OpenET API or local cache.
     """
-    # Try to load from local cache first
     df = load_cache(
         coords=geometry,
         start_date=start_date,
@@ -69,13 +73,12 @@ def get_et_data_cached(
         interval=interval,
         model=model,
         variable=variable,
-        max_age_hours=24  # Consider cache expired after 24 hours
+        max_age_hours=24
     )
-    
     if df is not None:
         return df
     
-    # If not in cache, call API
+    # If not in local cache, call OpenET API
     try:
         df = fetch_openet_data(
             geometry=geometry,
@@ -86,8 +89,6 @@ def get_et_data_cached(
             variable=variable,
             units=units
         )
-        
-        # Save to cache
         save_cache(
             coords=geometry,
             start_date=start_date,
@@ -97,11 +98,9 @@ def get_et_data_cached(
             model=model,
             variable=variable
         )
-        
         return df
     
     except OpenETError as e:
-        # Re-raise as a non-cached exception
         st.cache_data.clear()
         raise e
 
@@ -126,29 +125,39 @@ def initialize_session_state():
         st.session_state['show_demo'] = False
     
     if 'api_key' not in st.session_state:
-        # Try to get from environment
-        st.session_state['api_key'] = os.environ.get('OPENET_API_KEY', '')
-        
-    # Initialize date values
+        st.session_state['api_key'] = OPENET_API_KEY  # pre-load if found
+    
+    # Default date values
     if 'start_date' not in st.session_state:
         st.session_state['start_date'] = last_year.isoformat()
-    
     if 'end_date' not in st.session_state:
         st.session_state['end_date'] = today.isoformat()
-
-def create_map(center=DEFAULT_CENTER, zoom=DEFAULT_ZOOM):
-    """
-    Create an interactive map with drawing tools.
     
-    Returns:
-        folium.Map: The map object
+    # Default map center & zoom (can be updated by address search)
+    if 'map_center' not in st.session_state:
+        st.session_state['map_center'] = DEFAULT_CENTER
+    if 'map_zoom' not in st.session_state:
+        st.session_state['map_zoom'] = DEFAULT_ZOOM
+
+def create_map(center=None, zoom=None):
     """
+    Create an interactive map with drawing tools + ESRI World Imagery.
+    """
+    if center is None:
+        center = st.session_state['map_center']
+    if zoom is None:
+        zoom = st.session_state['map_zoom']
+    
     m = folium.Map(location=center, zoom_start=zoom, control_scale=True)
     
-    # Add tile layers
-    folium.TileLayer('openstreetmap').add_to(m)
-    folium.TileLayer('Stamen Terrain').add_to(m)
-    folium.TileLayer('CartoDB positron').add_to(m)
+    # Add ESRI World Imagery basemap
+    folium.TileLayer(
+        tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+        attr='Esri, Maxar, Earthstar Geographics, and the GIS User Community',
+        name='ESRI World Imagery',
+        overlay=False,
+        control=True
+    ).add_to(m)
     
     # Add drawing tools
     draw = Draw(
@@ -177,9 +186,8 @@ def create_map(center=DEFAULT_CENTER, zoom=DEFAULT_ZOOM):
     )
     measure.add_to(m)
     
-    # Add legend or info
+    # If a polygon is already selected, show it on the map
     if st.session_state['user_polygon'] is not None:
-        # If a polygon is already selected, show it on the map
         coords = st.session_state['user_polygon']
         if not isinstance(coords[0], (int, float)):  # It's a polygon
             folium.Polygon(
@@ -192,14 +200,16 @@ def create_map(center=DEFAULT_CENTER, zoom=DEFAULT_ZOOM):
             ).add_to(m)
             
             # Zoom to the polygon
-            sw = min(lat for _, lat in coords), min(lon for lon, _ in coords)
-            ne = max(lat for _, lat in coords), max(lon for lon, _ in coords)
-            m.fit_bounds([sw, ne])
+            sw_lat = min(lat for _, lat in coords)
+            sw_lon = min(lon for lon, _ in coords)
+            ne_lat = max(lat for _, lat in coords)
+            ne_lon = max(lon for lon, _ in coords)
+            m.fit_bounds([[sw_lat, sw_lon], [ne_lat, ne_lon]])
     
     return m
 
 def render_map_section():
-    """Render the map section for field selection."""
+    """Render the map section for field selection + optional address search."""
     st.subheader("1. Select Your Field")
     
     col1, col2 = st.columns([3, 1])
@@ -209,10 +219,10 @@ def render_map_section():
         m = create_map()
         map_data = st_folium(m, height=500, width=700)
         
-        # Process drawing results if available
+        # Process user drawings
         if map_data and map_data.get("all_drawings") is not None:
             drawings = map_data["all_drawings"]
-            if drawings and len(drawings) > 0:
+            if drawings:
                 if len(drawings) > 1:
                     st.info("Multiple shapes drawn. Using the most recent one.")
                 
@@ -231,13 +241,9 @@ def render_map_section():
                     coords = geometry.get("coordinates", [[]])[0]
                     
                     try:
-                        # Validate the geometry
                         validate_geometry(coords, "polygon")
-                        
-                        # Calculate area
                         area_sq_m = calculate_area(coords)
                         area_acres = area_sq_m * 0.000247105
-                        
                         if area_acres > MAX_AREA_ACRES:
                             st.error(f"Area exceeds maximum allowed size of {MAX_AREA_ACRES} acres. Please select a smaller area.")
                         else:
@@ -252,15 +258,51 @@ def render_map_section():
                         st.error(str(e))
     
     with col2:
-        st.write("**Draw your field on the map** or upload a boundary file.")
-        st.write("Use the polygon or rectangle tool to draw. Double-click to finish drawing.")
+        st.write("**Draw your field** using the polygon or rectangle tool, or **upload** a boundary file.\n")
+        
+        # Address search (optional)
+        st.markdown("**Optional: Search by Address**")
+        address_query = st.text_input("Enter address (autocomplete via Geoapify):", "")
+        
+        if address_query and GEOAPIFY_API_KEY:
+            # Query Geoapify autocomplete
+            geo_url = f"https://api.geoapify.com/v1/geocode/autocomplete?text={address_query}&apiKey={GEOAPIFY_API_KEY}"
+            try:
+                resp = requests.get(geo_url, timeout=10)
+                resp.raise_for_status()
+                features = resp.json().get("features", [])
+                
+                if not features:
+                    st.warning("No address matches found.")
+                else:
+                    # Build suggestion labels
+                    suggestions = [feat["properties"]["formatted"] for feat in features]
+                    selected_addr = st.selectbox("Select the correct address:", options=suggestions)
+                    
+                    if st.button("Locate"):
+                        # Find that feature
+                        chosen = None
+                        for feat in features:
+                            if feat["properties"]["formatted"] == selected_addr:
+                                chosen = feat
+                                break
+                        if chosen:
+                            lat = chosen["properties"]["lat"]
+                            lon = chosen["properties"]["lon"]
+                            # Update map center & zoom
+                            st.session_state['map_center'] = [lat, lon]
+                            st.session_state['map_zoom'] = 18
+                            st.experimental_rerun()
+            except requests.exceptions.RequestException as e:
+                st.error(f"Address lookup failed: {e}")
+        elif address_query and not GEOAPIFY_API_KEY:
+            st.warning("No GEOAPIFY_API_KEY found in environment. Cannot perform address search.")
         
         # File uploader
         uploaded_file = st.file_uploader(
             "Upload boundary file", 
             type=["zip", "geojson", "kml"]
         )
-        
         if uploaded_file:
             try:
                 coords, metadata = process_uploaded_geometry(uploaded_file, MAX_AREA_ACRES)
@@ -272,17 +314,13 @@ def render_map_section():
                 if metadata.get("geometry_type") == "polygon" and "area_acres" in metadata:
                     st.info(f"Field area: {metadata['area_acres']:.2f} acres ({metadata['area_sq_m']:.2f} sq meters)")
                 
-                # Trigger a rerun to show the polygon on the map
-                st.rerun()
-                
+                st.experimental_rerun()
             except Exception as e:
                 st.error(f"Error processing file: {str(e)}")
         
-        # Option to use demo field
+        # Demo field button
         if st.button("Use Demo Field"):
             demo_field = get_random_demo_field()
-            
-            # Calculate area
             area_sq_m = calculate_area(demo_field)
             area_acres = area_sq_m * 0.000247105
             
@@ -294,9 +332,9 @@ def render_map_section():
                 "area_sq_m": area_sq_m
             }
             st.success("Demo field loaded!")
-            st.rerun()
+            st.experimental_rerun()
     
-    # Display information about selected field
+    # Display info about selected field
     if st.session_state['user_polygon'] is not None and st.session_state['geometry_metadata'] is not None:
         coords = st.session_state['user_polygon']
         metadata = st.session_state['geometry_metadata']
@@ -304,12 +342,11 @@ def render_map_section():
         st.write("---")
         st.write("**Selected field information:**")
         
-        col1, col2 = st.columns(2)
-        with col1:
+        c1, c2 = st.columns(2)
+        with c1:
             st.write(format_coordinates_for_display(coords))
             if metadata.get("geometry_type") == "polygon" and "area_acres" in metadata:
                 st.write(f"Area: {metadata['area_acres']:.2f} acres ({metadata['area_sq_m']:.2f} sq meters)")
-            
             if metadata.get("source") == "upload":
                 st.write(f"Source: Uploaded file ({metadata.get('filename', 'unknown')})")
             elif metadata.get("source") == "draw":
@@ -317,136 +354,95 @@ def render_map_section():
             elif metadata.get("source") == "demo":
                 st.write("Source: Demo field")
         
-        with col2:
-            # Button to clear selection
+        with c2:
             if st.button("Clear Selection"):
                 st.session_state['user_polygon'] = None
                 st.session_state['geometry_metadata'] = None
                 st.session_state['et_data'] = None
                 st.session_state['last_query_params'] = None
-                st.rerun()
+                st.experimental_rerun()
 
 def render_data_parameters():
-    """Render the data parameters section."""
+    """Render the data parameters section for OpenET retrieval."""
     st.subheader("2. Set Data Parameters")
     
     col1, col2, col3 = st.columns(3)
     
-    # Save dates in session state to handle dependencies properly
-    if 'start_date' not in st.session_state:
-        st.session_state['start_date'] = (datetime.now().date() - timedelta(days=365)).isoformat()
-    if 'end_date' not in st.session_state:
-        st.session_state['end_date'] = datetime.now().date().isoformat()
-        
-    # Callback functions to update session state
+    # Use session state for date inputs
     def update_start_date():
-        start = st.session_state['start_date_input']
-        st.session_state['start_date'] = start.isoformat()
-        
+        st.session_state['start_date'] = st.session_state['start_date_input'].isoformat()
     def update_end_date():
-        end = st.session_state['end_date_input']
-        st.session_state['end_date'] = end.isoformat()
-        
+        st.session_state['end_date'] = st.session_state['end_date_input'].isoformat()
+    
+    today = datetime.now().date()
+    future_date = today + timedelta(days=365*10)  # allow selection up to 10 years future
+    
     with col1:
-        # Date range selection
-        today = datetime.now().date()
-        last_year = today - timedelta(days=365)
-        
-        # Convert stored string dates back to date objects
         default_start = datetime.fromisoformat(st.session_state['start_date']).date()
-        
-        # Future date for consistency with end date
-        future_date = today + timedelta(days=365*10)  # 10 years in the future
-        
         start_date = st.date_input(
             "Start Date", 
             value=default_start,
-            min_value=datetime(1985, 1, 1).date(),  # OpenET data starts around 1985
-            max_value=future_date,  # Allow future dates for forecasting scenarios
-            help="Select the start date for ET data",
+            min_value=datetime(1985, 1, 1).date(), 
+            max_value=future_date,
             key="start_date_input",
             on_change=update_start_date
         )
     
     with col2:
-        # Convert stored string dates back to date objects
         default_end = datetime.fromisoformat(st.session_state['end_date']).date()
-        
-        # Allow end dates into the future (10 years from now)
-        future_date = today + timedelta(days=365*10)  # 10 years in the future
-        
         end_date = st.date_input(
             "End Date", 
             value=default_end,
-            min_value=datetime(1985, 1, 1).date(),  # Remove dependency on start_date
-            max_value=future_date,  # Allow selection of future dates
-            help="Select the end date for ET data (can include future dates for forecasting)",
+            min_value=datetime(1985, 1, 1).date(),
+            max_value=future_date,
             key="end_date_input",
             on_change=update_end_date
         )
-        
-        # Add validation for end date being before start date
         if end_date < start_date:
             st.error("End date cannot be before start date")
-            end_date = start_date  # Force end date to be at least start date
-            
-        # Show warning message if future dates are selected
-        today = datetime.now().date()
+            end_date = start_date
         if end_date > today:
-            st.warning("FUTURE DATES NOT SUPPORTED: The OpenET API does not support future dates and API calls with future dates will not be run. In a future version, we will incorporate ET forecasting, but for now this functionality is a stub.")
+            st.warning("FUTURE DATES NOT SUPPORTED: The OpenET API does not return data beyond today's date.")
     
     with col3:
-        # Data interval
         interval = st.selectbox(
             "Data Interval", 
             options=["daily", "monthly"],
-            index=0,
-            help="Daily data provides more detail but monthly data may load faster for long time periods"
+            index=0
         )
     
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        # ET model selection
+    c1, c2, c3 = st.columns(3)
+    with c1:
         model = st.selectbox(
             "ET Model", 
             options=["Ensemble", "SSEBop", "SIMS", "PTJPL", "eeMETRIC", "DisALEXI"],
-            index=0,
-            help="Ensemble is the average of all models and recommended for most uses"
+            index=0
         )
-    
-    with col2:
-        # Variable selection (ET or others)
+    with c2:
         variable = st.selectbox(
             "Variable", 
             options=["ET", "ETo", "ETof", "NDVI", "PR"],
-            index=0,
-            help="ET = actual evapotranspiration, ETo = reference ET, PR = precipitation"
+            index=0
         )
-    
-    with col3:
-        # Units selection
+    with c3:
         units = st.selectbox(
             "Units", 
             options=["mm", "in"],
-            index=0,
-            help="Select units for data retrieval"
+            index=0
         )
     
     # API key input
     with st.expander("API Key Settings"):
         api_key = st.text_input(
             "OpenET API Key", 
-            value=st.session_state['api_key'],
-            type="password",
-            help="Enter your OpenET API key. You can get a free key from https://etdata.org"
+            value=st.session_state.get('api_key', ''),
+            type="password"
         )
         st.session_state['api_key'] = api_key
-        
         if not api_key:
-            st.warning("API key is required to fetch data from OpenET. If you don't have one, you can sign up for free at https://etdata.org")
+            st.warning("An API key is required to fetch data from OpenET. Sign up at https://etdata.org")
     
-    # Create a tuple of parameters to check if we need to refetch
+    # Prepare parameters for data fetch
     current_params = (
         str(st.session_state['user_polygon']), 
         start_date.isoformat(),
@@ -457,43 +453,35 @@ def render_data_parameters():
         units
     )
     
-    # Fetch data button
-    # Disable the button if no polygon, no API key, or future dates selected
-    today = datetime.now().date()
-    has_future_dates = end_date > today
-    
-    fetch_disabled = not st.session_state['user_polygon'] or not api_key
+    # Fetch button
+    fetch_disabled = (
+        st.session_state['user_polygon'] is None or 
+        not st.session_state['api_key']
+    )
     
     if st.button("Fetch ET Data", disabled=fetch_disabled, type="primary"):
-        # Check again for future dates - if selected, show a clear message
-        if has_future_dates:
-            st.error("API CALL BLOCKED: Cannot fetch data for future dates. Please select an end date no later than today.")
+        if end_date > today:
+            st.error("Cannot fetch data for a future date. Please select an end date no later than today.")
         elif st.session_state['last_query_params'] == current_params and st.session_state['et_data'] is not None:
-            st.success("Using cached data. Same parameters as previous query.")
+            st.success("Using previously fetched data. (Parameters unchanged.)")
         else:
-            with st.spinner("Fetching data from OpenET API..."):
+            with st.spinner("Fetching data from OpenET..."):
                 try:
-                    # FUTURE ENHANCEMENT: This is where ET forecasting would be implemented
-                    # For now, we only fetch historical data up to the present
-                    
-                    # Fetch data
                     df = get_et_data_cached(
                         geometry=st.session_state['user_polygon'],
                         start_date=start_date.isoformat(),
-                        end_date=min(end_date, today).isoformat(),  # Ensure end date is not in the future
+                        end_date=min(end_date, today).isoformat(),
                         interval=interval,
                         model=model,
                         variable=variable,
                         units=units
                     )
-                    
-                    if df is None or len(df) == 0:
-                        st.error("No data returned. This may be due to the area being outside OpenET coverage or no data for the selected period.")
+                    if df is None or df.empty:
+                        st.error("No data returned. Possibly out of coverage or no data for that period.")
                     else:
                         st.session_state['et_data'] = df
                         st.session_state['last_query_params'] = current_params
-                        st.success(f"Data retrieved successfully: {len(df)} data points from {start_date} to {min(end_date, today)}")
-                
+                        st.success(f"Data retrieved: {len(df)} records from {start_date} to {min(end_date, today)}")
                 except OpenETError as e:
                     st.error(f"Error fetching data: {str(e)}")
                 except Exception as e:
@@ -502,70 +490,48 @@ def render_data_parameters():
     return start_date, end_date, interval, model, variable, units
 
 def render_results(start_date, end_date, interval, model, variable, units):
-    """Render the results section with visualizations and recommendations."""
+    """Render results and irrigation recommendations."""
     if st.session_state['et_data'] is None:
         return
     
     st.subheader("3. Results and Irrigation Recommendations")
-    
-    # Get the data
     df = st.session_state['et_data']
     
-    # Create tabs for different visualizations
     tab1, tab2, tab3 = st.tabs(["ET Visualization", "Irrigation Recommendation", "Data Table"])
     
     with tab1:
-        st.write(f"**{variable} Data Visualization** ({interval} values from {start_date} to {end_date})")
-        
-        # Plot time series
+        st.write(f"**{variable} Time-Series** ({interval}, {start_date} to {end_date})")
         fig = px.line(
             df, 
             x='date', 
-            y=variable, 
+            y=variable,
             title=f"{model} {variable} ({units})",
             labels={'date': 'Date', variable: f"{variable} ({units})"}
         )
+        fig.update_layout(hovermode="x unified")
         
-        fig.update_layout(
-            xaxis_title="Date",
-            yaxis_title=f"{variable} ({units})",
-            hovermode="x unified"
-        )
-        
-        # Add monthly aggregation if data is daily
         if interval == "daily" and len(df) > 31:
-            # Create monthly aggregation
+            # Show monthly aggregation side-by-side
             df_monthly = df.copy()
             df_monthly['month'] = df_monthly['date'].dt.to_period('M')
             monthly_values = df_monthly.groupby('month')[variable].sum().reset_index()
             monthly_values['month'] = monthly_values['month'].dt.to_timestamp()
             
-            # Add bar chart for monthly totals
             fig2 = px.bar(
                 monthly_values, 
                 x='month', 
                 y=variable,
-                title=f"Monthly Total {variable} ({units})",
-                labels={'month': 'Month', variable: f"Total {variable} ({units})"}
+                title=f"Monthly Total {variable} ({units})"
             )
+            fig2.update_layout(hovermode="x unified")
             
-            fig2.update_layout(
-                xaxis_title="Month",
-                yaxis_title=f"Total {variable} ({units})",
-                hovermode="x unified"
-            )
-            
-            # Display both charts
             st.plotly_chart(fig, use_container_width=True)
             st.plotly_chart(fig2, use_container_width=True)
         else:
-            # Just display the time series
             st.plotly_chart(fig, use_container_width=True)
         
-        # Summary statistics
-        st.write("**Summary Statistics:**")
+        # Basic summary
         col1, col2, col3, col4 = st.columns(4)
-        
         with col1:
             st.metric("Total", f"{df[variable].sum():.1f} {units}")
         with col2:
@@ -573,60 +539,29 @@ def render_results(start_date, end_date, interval, model, variable, units):
         with col3:
             st.metric("Maximum", f"{df[variable].max():.2f} {units}")
         with col4:
-            if interval == "daily":
-                st.metric("Days", f"{len(df)}")
-            else:
-                st.metric("Months", f"{len(df)}")
+            st.metric("Count", f"{len(df)}")
     
     with tab2:
         st.write("**Irrigation Recommendation**")
+        mode = st.selectbox("Irrigation Mode", ["daily", "threshold"], index=0)
         
-        # Parameters for irrigation recommendations
-        col1, col2 = st.columns(2)
+        if mode == "threshold":
+            threshold = st.number_input("Depletion Threshold (mm)", min_value=10, max_value=100, value=30)
+        else:
+            threshold = 25  # default, not used for daily
         
-        with col1:
-            mode = st.selectbox(
-                "Irrigation Mode", 
-                options=["daily", "threshold"],
-                index=0,
-                help="Daily: replace ET-Rain each day; Threshold: irrigate when deficit reaches threshold"
-            )
-        
-        with col2:
-            if mode == "threshold":
-                threshold = st.number_input(
-                    "Depletion Threshold (mm)", 
-                    min_value=10, 
-                    max_value=100, 
-                    value=30,
-                    help="Amount of water depletion (mm) to trigger irrigation"
-                )
-            else:
-                threshold = 25  # default, not used for daily mode
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            efficiency = st.slider(
-                "Irrigation System Efficiency (%)", 
-                min_value=50, 
-                max_value=100, 
-                value=85,
-                help="Efficiency of your irrigation system (drip ~ 90%, sprinkler ~ 75%, flood ~ 60%)"
-            ) / 100.0
-        
-        with col2:
+        colA, colB = st.columns(2)
+        with colA:
+            efficiency = st.slider("Irrigation Efficiency (%)", 50, 100, 85) / 100.0
+        with colB:
             display_units = st.selectbox(
                 "Display Units", 
                 options=["mm", "inches"],
-                index=0 if units == "mm" else 1,
-                help="Units for displaying results"
+                index=0 if units == "mm" else 1
             )
         
-        # Check if we have precipitation data
-        rain_col = "PR" if "PR" in df.columns else None
+        rain_col = "PR" if "PR" in df.columns else "Rain" if "Rain" in df.columns else None
         
-        # Get irrigation recommendation
         try:
             recommendation = get_irrigation_recommendation(
                 df=df,
@@ -637,125 +572,91 @@ def render_results(start_date, end_date, interval, model, variable, units):
                 rain_col=rain_col,
                 units=display_units
             )
-            
-            # Display recommendation summary
-            st.info(recommendation["recommendation"])
-            
-            # Display summary in a nice box
-            st.success(summarize_irrigation_needs(recommendation))
-            
-            # For threshold mode, show scheduled irrigations
-            if mode == "threshold" and recommendation["status"] == "success":
-                if recommendation.get("schedule") and len(recommendation["schedule"]) > 0:
-                    # Create a table of scheduled irrigations
-                    schedule_df = pd.DataFrame(recommendation["schedule"])
-                    
-                    fig = go.Figure(data=[
-                        go.Table(
-                            header=dict(
-                                values=["Date", f"Amount ({display_units})"],
-                                fill_color='paleturquoise',
-                                align='left'
-                            ),
-                            cells=dict(
-                                values=[
-                                    schedule_df['date'], 
-                                    schedule_df['amount']
-                                ],
-                                fill_color='lavender',
-                                align='left'
+            if recommendation["status"] == "success":
+                st.info(recommendation["recommendation"])
+                st.success(summarize_irrigation_needs(recommendation))
+                
+                # If threshold mode, show schedule
+                if mode == "threshold" and "schedule" in recommendation:
+                    schedule_list = recommendation["schedule"]
+                    if schedule_list:
+                        sched_df = pd.DataFrame(schedule_list)
+                        fig_sched = go.Figure(data=[
+                            go.Table(
+                                header=dict(values=["Date", f"Amount ({display_units})"], fill_color='paleturquoise', align='left'),
+                                cells=dict(values=[sched_df['date'], sched_df['amount']], fill_color='lavender', align='left')
                             )
-                        )
-                    ])
+                        ])
+                        st.plotly_chart(fig_sched, use_container_width=True)
+                    else:
+                        st.write("No irrigation events scheduled for this period.")
+                
+                # Cumulative chart if daily
+                if interval == "daily":
+                    df_cum = df.copy()
+                    df_cum['Cumulative_ET'] = df_cum[variable].cumsum()
+                    if rain_col:
+                        df_cum['Net_ET'] = (df_cum[variable] - df_cum[rain_col]).clip(lower=0)
+                        df_cum['Cumulative_Net_ET'] = df_cum['Net_ET'].cumsum()
+                        df_cum['Cumulative_Rain'] = df_cum[rain_col].cumsum()
                     
-                    st.plotly_chart(fig, use_container_width=True)
-                else:
-                    st.write("No irrigation events scheduled for this period.")
+                    # Unit conversion if needed
+                    if display_units != units:
+                        conv = 1/25.4 if display_units == "inches" else 25.4
+                        for col in ['Cumulative_ET','Net_ET','Cumulative_Net_ET','Cumulative_Rain']:
+                            if col in df_cum.columns:
+                                df_cum[col] = df_cum[col] * conv
+                    
+                    fig_cum = go.Figure()
+                    fig_cum.add_trace(go.Scatter(
+                        x=df_cum['date'],
+                        y=df_cum['Cumulative_ET'],
+                        mode='lines', name=f"Cumulative {variable}",
+                        line=dict(color='red', width=2)
+                    ))
+                    if rain_col:
+                        fig_cum.add_trace(go.Scatter(
+                            x=df_cum['date'],
+                            y=df_cum['Cumulative_Rain'],
+                            mode='lines', name=f"Cumulative Rain",
+                            line=dict(color='blue', width=2)
+                        ))
+                        fig_cum.add_trace(go.Scatter(
+                            x=df_cum['date'],
+                            y=df_cum['Cumulative_Net_ET'],
+                            mode='lines', name='Cumulative Net ET',
+                            line=dict(color='orange', width=2)
+                        ))
+                    fig_cum.update_layout(
+                        title=f"Cumulative Water Balance ({display_units})",
+                        xaxis_title="Date",
+                        yaxis_title=f"Cumulative Amount ({display_units})",
+                        hovermode="x unified"
+                    )
+                    st.plotly_chart(fig_cum, use_container_width=True)
             
-            # Visualization of cumulative ET vs irrigation
-            if interval == "daily":
-                # Create cumulative plots
-                df_cum = df.copy()
-                df_cum['Cumulative_ET'] = df_cum[variable].cumsum()
-                
-                # Calculate net ET (ET - rain)
-                if rain_col:
-                    df_cum['Net_ET'] = (df_cum[variable] - df_cum[rain_col]).clip(lower=0)
-                    df_cum['Cumulative_Net_ET'] = df_cum['Net_ET'].cumsum()
-                    df_cum['Cumulative_Rain'] = df_cum[rain_col].cumsum()
-                
-                # Convert to display units if needed
-                conversion = 1.0 if display_units == units else (1/25.4 if display_units == "inches" else 25.4)
-                for col in df_cum.columns:
-                    if col not in ['date'] and df_cum[col].dtype.kind in 'fc':  # float or complex columns
-                        df_cum[col] = df_cum[col] * conversion
-                
-                # Create plot
-                fig = go.Figure()
-                
-                # Add cumulative ET
-                fig.add_trace(go.Scatter(
-                    x=df_cum['date'], 
-                    y=df_cum['Cumulative_ET'],
-                    mode='lines',
-                    name=f'Cumulative {variable}',
-                    line=dict(color='red', width=2)
-                ))
-                
-                # Add rain if available
-                if rain_col:
-                    fig.add_trace(go.Scatter(
-                        x=df_cum['date'], 
-                        y=df_cum['Cumulative_Rain'],
-                        mode='lines',
-                        name='Cumulative Rainfall',
-                        line=dict(color='blue', width=2)
-                    ))
-                    
-                    fig.add_trace(go.Scatter(
-                        x=df_cum['date'], 
-                        y=df_cum['Cumulative_Net_ET'],
-                        mode='lines',
-                        name='Cumulative Net ET (ET-Rain)',
-                        line=dict(color='orange', width=2)
-                    ))
-                
-                # Update layout
-                fig.update_layout(
-                    title=f"Cumulative Water Balance ({display_units})",
-                    xaxis_title="Date",
-                    yaxis_title=f"Cumulative Amount ({display_units})",
-                    hovermode="x unified",
-                    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
-                )
-                
-                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.error(recommendation["message"])
         
         except Exception as e:
             st.error(f"Error generating irrigation recommendation: {str(e)}")
     
     with tab3:
         st.write("**Raw Data Table**")
-        
-        # Convert to display units if different from API units
         display_df = df.copy()
-        if display_units != units:
-            conversion = 1/25.4 if display_units == "inches" else 25.4
-            for col in df.columns:
-                if col != 'date' and df[col].dtype.kind in 'fc':  # float or complex columns
-                    display_df[col] = df[col] * conversion
+        if units != display_units:
+            conv = 1/25.4 if display_units == "inches" else 25.4
+            numeric_cols = [col for col in display_df.columns if col != "date" and pd.api.types.is_numeric_dtype(display_df[col])]
+            for col in numeric_cols:
+                display_df[col] = display_df[col] * conv
         
-        # Format date column
         display_df['date'] = display_df['date'].dt.strftime('%Y-%m-%d')
-        
-        # Show the table
         st.dataframe(display_df, use_container_width=True)
         
-        # Download button
-        csv = display_df.to_csv(index=False).encode('utf-8')
+        csv_data = display_df.to_csv(index=False).encode('utf-8')
         st.download_button(
             "Download CSV",
-            csv,
+            csv_data,
             f"openet_{variable}_{start_date}_to_{end_date}.csv",
             "text/csv",
             key='download-csv'
@@ -764,86 +665,59 @@ def render_results(start_date, end_date, interval, model, variable, units):
 def render_sidebar():
     """Render the sidebar with app information and settings."""
     st.sidebar.title("OpenET Irrigation Advisory")
-    
     st.sidebar.markdown("""
-    This app demonstrates how to use [OpenET](https://etdata.org) data 
+    This app demonstrates how to use [OpenET](https://etdata.org) data
     to provide irrigation recommendations for agricultural fields.
     """)
-    
     st.sidebar.subheader("How to Use")
     st.sidebar.markdown("""
-    1. Draw your field on the map or upload a boundary file
-    2. Set the date range and data parameters
-    3. Click "Fetch ET Data" to retrieve data
-    4. View the results and irrigation recommendations
+    1. Draw or upload your field boundary.
+    2. (Optional) Use Geoapify address search to jump to a location.
+    3. Set date range & data parameters.
+    4. Click "Fetch ET Data".
+    5. View results & irrigation recommendations.
     """)
-    
     st.sidebar.subheader("About")
     st.sidebar.markdown("""
-    OpenET provides satellite-based evapotranspiration (ET) data 
-    that can be used to estimate crop water use and irrigation needs.
-    
-    This app demonstrates how this data can be used to create 
-    simple irrigation schedules based on ET replacement.
+    OpenET provides satellite-based evapotranspiration (ET) data for
+    estimating crop water use. This demo illustrates basic irrigation
+    scheduling logic.
     """)
-    
-    # Disclaimer
     st.sidebar.subheader("Disclaimer")
     st.sidebar.info("""
-    The irrigation recommendations provided by this app are estimates 
-    based on ET data and should be used as a guide only. Actual irrigation 
-    needs may vary based on specific field conditions, irrigation system 
-    efficiency, and local weather patterns.
+    The irrigation recommendations are estimates based on ET data
+    and should be used as a guide only. Actual needs may vary
+    by field conditions and other factors.
     """)
-    
-    # Add link to OpenET
     st.sidebar.markdown("[Learn more about OpenET](https://etdata.org)")
-    
-    # App version
-    st.sidebar.caption("App Version: 1.0.0")
+    st.sidebar.caption("App Version: 1.0.1")
 
 def main():
-    """Main function to run the Streamlit app."""
-    # Initialize session state
+    """Main Streamlit app entry point."""
     initialize_session_state()
-    
-    # App title
     st.title(APP_TITLE)
-    
-    # Render sidebar
     render_sidebar()
     
-    # Main content
     render_map_section()
-    
     if st.session_state['user_polygon'] is not None:
-        # Render data parameters section
         start_date, end_date, interval, model, variable, units = render_data_parameters()
-        
-        # Render results if data is available
         if st.session_state['et_data'] is not None:
             render_results(start_date, end_date, interval, model, variable, units)
     
-    # Add an expander for cache info (for developers/testing)
     with st.expander("Cache Information", expanded=False):
-        st.write("This section shows information about the local cache for developers.")
-        
-        cache_info = get_cache_info()
-        st.write(f"Cache entries: {cache_info['count']}")
-        st.write(f"Total cache size: {cache_info['total_size_kb']:.2f} KB")
-        
+        st.write("Local cache info (for debugging):")
+        info = get_cache_info()
+        st.write(f"Entries: {info.get('count',0)}")
+        st.write(f"Total size: {info.get('total_size_kb',0.0):.2f} KB")
         if st.button("Clear Cache"):
             if clear_cache():
-                st.success("Cache cleared successfully")
+                st.success("Cache cleared.")
+                st.cache_data.clear()
             else:
-                st.error("Failed to clear cache")
-            
-            # Also clear Streamlit cache
-            st.cache_data.clear()
+                st.error("Failed to clear cache.")
     
-    # Footer
     st.write("---")
-    st.caption("Powered by OpenET API | Data source: [OpenET](https://etdata.org)")
+    st.caption("Powered by OpenET API | ESRI World Imagery basemap | Geoapify address search")
 
 if __name__ == "__main__":
     main()
