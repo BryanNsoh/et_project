@@ -45,7 +45,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# --- CUSTOM CSS (Cleaned up) ---
+# --- CUSTOM CSS (with fixed status box text colors) ---
 st.markdown("""
 <style>
     /* Space around main container */
@@ -147,7 +147,7 @@ st.markdown("""
         color: white;
     }
 
-    /* Status boxes */
+    /* Status boxes - FIXED TEXT COLORS */
     .status-box {
         padding: 1rem;
         border-radius: 0.5rem;
@@ -157,18 +157,44 @@ st.markdown("""
     .info-box {
         background-color: #f0f6fb;
         border-left: 5px solid #4287f5;
+        color: #333333;
+    }
+    .info-box h4 {
+        color: #1e5b94;
+        margin-top: 0;
+        margin-bottom: 0.5rem;
+    }
+    .info-box p {
+        color: #333333;
     }
     .success-box {
         background-color: #f0f9f5;
         border-left: 5px solid #13ab5c;
+        color: #333333;
+    }
+    .success-box h4 {
+        color: #13ab5c;
+        margin-top: 0;
+        margin-bottom: 0.5rem;
+    }
+    .success-box p {
+        color: #333333;
     }
     .warning-box {
         background-color: #fffaf0;
         border-left: 5px solid #f7b034;
+        color: #333333;
+    }
+    .warning-box h4 {
+        color: #f7b034;
     }
     .error-box {
         background-color: #fef2f1;
         border-left: 5px solid #ef564d;
+        color: #333333;
+    }
+    .error-box h4 {
+        color: #ef564d;
     }
 
     /* Space optimization */
@@ -197,7 +223,7 @@ st.markdown("""
 def get_et_data_cached(
     geometry: List,
     start_date: str,
-    end_date: str, 
+    end_date: str,
     interval: str = "daily",
     model: str = "Ensemble",
     variable: str = "ET",
@@ -245,7 +271,8 @@ def get_et_data_cached(
 def initialize_session_state():
     """Initialize Streamlit session state variables if they don't exist."""
     today = datetime.now().date()
-    last_year = today - timedelta(days=365)
+    # Default to the past 10 days (instead of a full year).
+    last_10_days = today - timedelta(days=10)
     
     if 'user_polygon' not in st.session_state:
         st.session_state['user_polygon'] = None
@@ -258,9 +285,9 @@ def initialize_session_state():
     if 'api_key' not in st.session_state:
         st.session_state['api_key'] = OPENET_API_KEY  # pre-load if found
     
-    # Default date values
+    # Default date values: last 10 days to today
     if 'start_date' not in st.session_state:
-        st.session_state['start_date'] = last_year.isoformat()
+        st.session_state['start_date'] = last_10_days.isoformat()
     if 'end_date' not in st.session_state:
         st.session_state['end_date'] = today.isoformat()
     
@@ -269,10 +296,27 @@ def initialize_session_state():
         st.session_state['map_center'] = DEFAULT_CENTER
     if 'map_zoom' not in st.session_state:
         st.session_state['map_zoom'] = DEFAULT_ZOOM
+        
+    # Flag to control drawing mode 
+    if 'draw_mode' not in st.session_state:
+        st.session_state['draw_mode'] = True
+        
+    # Flag to store address search errors
+    if 'address_error' not in st.session_state:
+        st.session_state['address_error'] = None
+    
+    # Flag to handle data fetching
+    if 'is_fetching' not in st.session_state:
+        st.session_state['is_fetching'] = False
+    
+    # Store the actual polygon object for rendering
+    if 'polygon_layer' not in st.session_state:
+        st.session_state['polygon_layer'] = None
 
 def create_map(center=None, zoom=None):
     """
     Create an interactive map with drawing tools + ESRI World Imagery.
+    Ensures polygon borders remain visible after selection.
     """
     if center is None:
         center = st.session_state['map_center']
@@ -290,22 +334,23 @@ def create_map(center=None, zoom=None):
         control=True
     ).add_to(m)
     
-    # Add drawing tools
-    draw = Draw(
-        draw_options={
-            'polyline': False,
-            'rectangle': True,
-            'polygon': True,
-            'circle': False,
-            'marker': False,
-            'circlemarker': False
-        },
-        edit_options={
-            'poly': {'allowIntersection': False},
-            'featureGroup': None
-        }
-    )
-    draw.add_to(m)
+    # Only add drawing tools if in drawing mode
+    if st.session_state['draw_mode']:
+        draw = Draw(
+            draw_options={
+                'polyline': False,
+                'rectangle': True,
+                'polygon': True,
+                'circle': False,
+                'marker': False,
+                'circlemarker': False
+            },
+            edit_options={
+                'poly': {'allowIntersection': False},
+                'featureGroup': None
+            }
+        )
+        draw.add_to(m)
     
     # Add measurement tool
     measure = MeasureControl(
@@ -317,25 +362,51 @@ def create_map(center=None, zoom=None):
     )
     measure.add_to(m)
     
-    # If a polygon is already selected, show it on the map
+    # If a polygon is already selected, show it on the map with enhanced styling
     if st.session_state['user_polygon'] is not None:
         coords = st.session_state['user_polygon']
         if not isinstance(coords[0], (int, float)):
-            folium.Polygon(
+            # Create polygon with enhanced styling for better visibility
+            polygon = folium.Polygon(
                 locations=coords,
-                color='#1e5b94',
+                color='#FF4500',  # Bright orange border for high visibility
+                weight=4,          # Thicker border
+                opacity=1.0,       # Fully opaque border
                 fill=True,
                 fill_color='#1e5b94',
                 fill_opacity=0.3,
-                tooltip='Selected Field'
-            ).add_to(m)
+                tooltip='Selected Field',
+                highlight=True     # Enable highlighting on hover
+            )
+            polygon.add_to(m)
+                
+            # Add markers at the vertices for more visibility
+            for point in coords:
+                folium.CircleMarker(
+                    location=point,
+                    radius=3,
+                    color='#FF4500',
+                    fill=True,
+                    fill_color='#FFFFFF',
+                    fill_opacity=1.0
+                ).add_to(m)
             
-            # Zoom to the polygon
+            # Zoom to the polygon with a slight buffer
             sw_lat = min(lat for _, lat in coords)
             sw_lon = min(lon for lon, _ in coords)
             ne_lat = max(lat for _, lat in coords)
             ne_lon = max(lon for lon, _ in coords)
-            m.fit_bounds([[sw_lat, sw_lon], [ne_lat, ne_lon]])
+            
+            # Add a small buffer (5% of the polygon size) to ensure visibility
+            lat_range = ne_lat - sw_lat
+            lon_range = ne_lon - sw_lon
+            buffer_lat = max(0.0001, lat_range * 0.05)  # At least a tiny buffer
+            buffer_lon = max(0.0001, lon_range * 0.05)
+            
+            m.fit_bounds([
+                [sw_lat - buffer_lat, sw_lon - buffer_lon], 
+                [ne_lat + buffer_lat, ne_lon + buffer_lon]
+            ])
     
     return m
 
@@ -452,12 +523,28 @@ def render_sidebar():
         'display_units': display_units
     }
 
+def on_fetch_button_click():
+    """Handle fetch button clicks to avoid needing to click twice"""
+    st.session_state['is_fetching'] = True
+
 def render_map_section():
     """
     Simplified Geoapify address search:
     Automatically uses the first address match to re-center the map.
     """
     st.header("Field Selection")
+
+    # Show info about currently selected field if exists
+    if st.session_state['user_polygon'] is not None and st.session_state['geometry_metadata'] is not None:
+        st.markdown(
+            f"""
+            <div class="selected-field-box">
+                <h3>Field Selected</h3>
+                <p>Area: {st.session_state['geometry_metadata']['area_acres']:.2f} acres</p>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
 
     address_col, button_col = st.columns([4, 1])
     with address_col:
@@ -470,6 +557,10 @@ def render_map_section():
     with button_col:
         search_clicked = st.button("Search", key="address_search_button")
 
+    # Display persistent address error if it exists
+    if st.session_state.get('address_error'):
+        st.warning(st.session_state['address_error'])
+
     if search_clicked and address_query and GEOAPIFY_API_KEY:
         geo_url = f"https://api.geoapify.com/v1/geocode/autocomplete?text={address_query}&apiKey={GEOAPIFY_API_KEY}"
         try:
@@ -477,6 +568,7 @@ def render_map_section():
             resp.raise_for_status()
             features = resp.json().get("features", [])
             if not features:
+                st.session_state['address_error'] = "No address matches found."
                 st.warning("No address matches found.")
             else:
                 # Automatically use the first address candidate
@@ -485,17 +577,22 @@ def render_map_section():
                 lon = first_candidate["properties"]["lon"]
                 st.session_state['map_center'] = [lat, lon]
                 st.session_state['map_zoom'] = 18
+                st.session_state['address_error'] = None  # Clear error on success
                 st.experimental_rerun()
         except requests.exceptions.RequestException as e:
-            st.error(f"Address lookup failed: {e}")
+            error_msg = f"Address lookup failed: {e}"
+            st.session_state['address_error'] = error_msg
+            st.error(error_msg)
     elif search_clicked and not GEOAPIFY_API_KEY:
-        st.warning("No GEOAPIFY_API_KEY found in environment. Cannot perform address search.")
+        error_msg = "No GEOAPIFY_API_KEY found in environment. Cannot perform address search."
+        st.session_state['address_error'] = error_msg
+        st.warning(error_msg)
 
     map_col, control_col = st.columns([4, 1])
     with map_col:
         m = create_map()
         map_data = st_folium(m, height=450, width="100%")
-        if map_data and map_data.get("all_drawings"):
+        if map_data and map_data.get("all_drawings") and st.session_state['draw_mode']:
             drawings = map_data["all_drawings"]
             if drawings:
                 last_drawing = drawings[-1]
@@ -514,6 +611,9 @@ def render_map_section():
                                 "area_acres": area_acres,
                                 "area_sq_m": area_sq_m
                             }
+                            # Turn off drawing mode once a valid polygon is selected
+                            st.session_state['draw_mode'] = False
+                            st.experimental_rerun()
                         else:
                             st.error(f"Area exceeds limit of {MAX_AREA_ACRES} acres.")
                     except ValueError as e:
@@ -529,15 +629,21 @@ def render_map_section():
             </ol>
         </div>
         """, unsafe_allow_html=True)
+        
         if st.session_state['user_polygon']:
+            # Add new "Draw New Polygon" button
+            if st.button("Draw New Polygon"):
+                st.session_state['draw_mode'] = True
+                st.experimental_rerun()
+                
             if st.button("Clear Selection", key="clear_selection"):
                 st.session_state['user_polygon'] = None
                 st.session_state['geometry_metadata'] = None
                 st.session_state['et_data'] = None
                 st.session_state['last_query_params'] = None
+                # Re-enable drawing mode when selection is cleared
+                st.session_state['draw_mode'] = True
                 st.experimental_rerun()
-            if st.button("Fetch ET Data", key="fetch_data"):
-                fetch_data(initialize_session_state())
 
 def fetch_data(params):
     """Fetch ET data based on parameters."""
@@ -547,6 +653,7 @@ def fetch_data(params):
     if not st.session_state['api_key']:
         st.warning("An API key is required to fetch data from OpenET. Please enter your API key in the sidebar.")
         return
+    
     start_date = params['start_date']
     end_date = params['end_date']
     current_params = (
@@ -561,6 +668,7 @@ def fetch_data(params):
     if st.session_state['last_query_params'] == current_params and st.session_state['et_data'] is not None:
         st.success("Using previously fetched data.")
         return
+    
     with st.spinner("Retrieving data from satellite measurements..."):
         try:
             today = datetime.now().date()
@@ -685,7 +793,7 @@ def render_results(params):
             st.markdown(f"""
             <div class="status-box info-box">
                 <h4>Recommendation</h4>
-                {recommendation["recommendation"]}
+                <p>{recommendation["recommendation"]}</p>
             </div>
             """, unsafe_allow_html=True)
             st.markdown(f"""
@@ -694,7 +802,7 @@ def render_results(params):
                 <p>Period analyzed: {recommendation["period_days"]} days<br>
                 Total crop water use (ET): {recommendation["total_et"]:.1f} {display_units}<br>
                 {f"Total rainfall: {recommendation['total_rain']:.1f} {display_units}<br>" if recommendation["total_rain"] > 0 else ""}
-                Total irrigation need: {recommendation["total_irrigation"]:.1f} {display_units}</p>
+                Total irrigation need: {recommendation["total_irrigation"]:.1f} {display_units}
             </div>
             """, unsafe_allow_html=True)
             if mode == "threshold" and "schedule" in recommendation and recommendation["schedule"]:
@@ -777,13 +885,23 @@ def main():
     st.markdown("Satellite-based irrigation recommendations for optimizing water use in agriculture")
     params = render_sidebar()
     render_map_section()
+    
     if st.session_state['user_polygon'] is not None:
         fetch_button_col1, fetch_button_col2 = st.columns([1, 3])
         with fetch_button_col1:
-            if st.button("Fetch ET Data", key="fetch_button", type="primary"):
-                fetch_data(params)
+            # Use on_click handler to avoid needing to click twice
+            if st.button("Fetch ET Data", key="fetch_button", type="primary", on_click=on_fetch_button_click):
+                pass  # The action happens in the on_click handler
+        
+        # Fetch data in the same app run when button is clicked
+        if st.session_state['is_fetching']:
+            fetch_data(params)
+            st.session_state['is_fetching'] = False  # Reset the flag
+        
+        # Display results if data exists
         if st.session_state['et_data'] is not None:
             render_results(params)
+    
     st.markdown("---")
     st.caption("Powered by [OpenET](https://openetdata.org) | ESRI World Imagery basemap | Geoapify address search")
 
